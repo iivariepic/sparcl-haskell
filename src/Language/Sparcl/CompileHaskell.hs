@@ -11,7 +11,21 @@ data HaskellCode = HaskellCode
     }
     deriving (Show, Eq)
 
+-- Literals
+compileLiteral :: Literal.Literal -> String
+compileLiteral l = case l of
+    Literal.LitInt i    -> show i
+    _                   -> error "compileLiteral: Unhandled literal type"
+
 -- The Main Compiler Function
 compileExpression :: Core.Exp Name.Name -> HaskellCode
 compileExpression expr = case expr of
+    -- Literal values
+    Core.Lit l ->
+        let code = compileLiteral l
+        in HaskellCode
+            { hsForward = code
+            , hsBackward = code
+            }
+
     _ -> error "compileExpression: Unimplemented constructor"
