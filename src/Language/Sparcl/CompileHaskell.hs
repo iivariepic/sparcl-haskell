@@ -35,5 +35,18 @@ compileExpression expr = case expr of
             { hsForward = nameString
             , hsBackward = nameString
             }
-            
+
+    -- Recursive compilation of the entire App
+    Core.App e1 e2 ->
+        let
+            code1 = compileExpression e1
+            code2 = compileExpression e2
+
+            fwdApp = "(" + hsForward code1 ++ " " ++ hsForward code2 ++ ")"
+            bwdApp = "(" + hsBacward code1 ++ " " ++ hsBackward code2 ++ ")"
+        in HaskellCode
+            { hsForward = fwdApp
+            , hsBackward = bwdApp
+            }
+
     _ -> error "compileExpression: Unimplemented constructor"
