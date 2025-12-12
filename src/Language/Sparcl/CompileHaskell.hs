@@ -28,4 +28,12 @@ compileExpression expr = case expr of
             , hsBackward = code
             }
 
+    -- Variables
+    Core.Var n ->
+        let nameString = show n
+        in HaskellCode
+            { hsForward = nameString
+            , hsBackward = nameString
+            }
+            
     _ -> error "compileExpression: Unimplemented constructor"
