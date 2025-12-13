@@ -10,22 +10,27 @@ import           Text.Read             (readMaybe)
 data OptConf = OptConf { optSearchPath     :: !(Maybe [FilePath]),
                          optInputFile      :: !(Maybe FilePath),
                          optVerbosityLevel :: !VerbosityLevel,
-                         optHelpMode       :: !Bool }
+                         optHelpMode       :: !Bool,
+                         optCompileMode    :: !Bool
+                         }
 
 initOptConf :: OptConf
 initOptConf = OptConf { optSearchPath = Nothing,
                         optInputFile  = Nothing,
                         optVerbosityLevel = 0,
-                        optHelpMode = False }
+                        optHelpMode = False,
+                        optCompileMode = False
+                        }
 
 options :: [ OptDescr (OptConf -> OptConf) ]
 options =
   [ Option ['v'] ["verbosity"] (OptArg optV "VERBOSITY") "Set the verbosity level to VERBOSITY.",
-    Option ['h'] ["help"]      (NoArg optH) "Show this help message."
-  ]
+    Option ['c'] ["compile"]   (NoArg optC) "Compile the input file into Haskell",
+    Option ['h'] ["help"]      (NoArg optH) "Show this help message." ]
   where
     optV m c = c { optVerbosityLevel = fromMaybe 1 (readMaybe =<< m) }
     optH c = c { optHelpMode = True }
+    optC c = c { optCompileMode = True }
 
 helpMessage :: IO ()
 helpMessage = do
@@ -34,8 +39,6 @@ helpMessage = do
         unlines [ "An interactive environment for Sparcl.",
                   "Usage: " ++ prog ++ " OPTIONS [FILENAME]" ]
   putStrLn (usageInfo header options)
-
-
 
 parseArgs :: IO (Maybe OptConf)
 parseArgs = do
@@ -59,6 +62,8 @@ main = do
     Just oc ->
       if optHelpMode oc then
         helpMessage
+      else if optCompileMode oc then
+        putStrLn "hello compiler!"
       else
         startREPL (optVerbosityLevel oc) (optSearchPath oc) (optInputFile oc)
     Nothing -> return ()
