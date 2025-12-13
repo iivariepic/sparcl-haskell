@@ -50,3 +50,22 @@ compileExpression expr = case expr of
             }
 
     _ -> error "compileExpression: Unimplemented constructor"
+
+-- Test function for compiling the code with the unimplemented constructors hard coded
+compileModule :: HaskellCode -> String
+compileModule (HaskellCode fwdCode bwdCode) = unlines
+    [     "module Test where"
+        , ""
+        , "fwd_result :: IO ()"
+        , "fwd_result = putStrLn $ show (" ++ fwdCode ++ ")"
+        , ""
+        , "bwd_result :: IO ()"
+        , "bwd_result = putStrLn $ show (" ++ bwdCode ++ ")"
+        , ""
+        , "main :: IO ()"
+        , "main = do"
+        , "  putStrLn \"--- Forward Result ---\""
+        , "  fwd_result"
+        , "  putStrLn \"--- Backward Result ---\""
+        , "  bwd_result"
+        ]

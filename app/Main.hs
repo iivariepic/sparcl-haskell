@@ -1,6 +1,8 @@
 module Main where
 
-import           Language.Sparcl.REPL  (VerbosityLevel, startREPL)
+import           Language.Sparcl.REPL     (VerbosityLevel, startREPL)
+import           Language.Sparcl.Compiler (compileFile)
+
 import           System.Console.GetOpt
 import           System.Environment
 
@@ -63,7 +65,11 @@ main = do
       if optHelpMode oc then
         helpMessage
       else if optCompileMode oc then
-        putStrLn "hello compiler!"
+        case optInputFile oc of
+            Just inputFile -> compileFile inputFile
+            Nothing -> do
+                putStrLn "Error: Compile mode (-c) requires an input Sparcl file."
+                helpMessage
       else
         startREPL (optVerbosityLevel oc) (optSearchPath oc) (optInputFile oc)
     Nothing -> return ()
