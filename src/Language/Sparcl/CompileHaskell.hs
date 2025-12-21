@@ -17,6 +17,13 @@ compileLiteral l = case l of
     Literal.LitInt i    -> show i
     _                   -> error "compileLiteral: Unhandled literal type"
 
+-- Top-level Bindings
+compileBinding :: (Name.Name, Core.Exp Name.Name) -> String
+compileBinding (name, expr) =
+  let code = compileExpression expr
+      nameStr = show name
+  in nameStr ++ " = " ++ hsForward code
+
 -- The Main Compiler Function
 compileExpression :: Core.Exp Name.Name -> HaskellCode
 compileExpression expr = case expr of
@@ -50,22 +57,3 @@ compileExpression expr = case expr of
             }
 
     _ -> error "compileExpression: Unimplemented constructor"
-
--- Test function for compiling the code with the unimplemented constructors hard coded
-compileModule :: HaskellCode -> String
-compileModule (HaskellCode fwdCode bwdCode) = unlines
-    [     "module Test where"
-        , ""
-        , "fwd_result :: IO ()"
-        , "fwd_result = putStrLn $ show (" ++ fwdCode ++ ")"
-        , ""
-        , "bwd_result :: IO ()"
-        , "bwd_result = putStrLn $ show (" ++ bwdCode ++ ")"
-        , ""
-        , "main :: IO ()"
-        , "main = do"
-        , "  putStrLn \"--- Forward Result ---\""
-        , "  fwd_result"
-        , "  putStrLn \"--- Backward Result ---\""
-        , "  bwd_result"
-        ]
