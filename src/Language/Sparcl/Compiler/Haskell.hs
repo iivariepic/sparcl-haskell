@@ -3,6 +3,7 @@ module Language.Sparcl.Compiler.Haskell where
 import qualified Language.Sparcl.Core.Syntax as Core
 import qualified Language.Sparcl.Name as Name
 import qualified Language.Sparcl.Literal as Literal
+import           Language.Sparcl.Pretty (prettyShow)
 
 -- The type for the code output
 data HaskellCode = HaskellCode
@@ -21,7 +22,7 @@ compileLiteral l = case l of
 compileBinding :: (Name.Name, Core.Exp Name.Name) -> String
 compileBinding (name, expr) =
   let code = compileExpression expr
-      nameStr = show name
+      nameStr = prettyShow name
   in nameStr ++ " = " ++ hsForward code
 
 -- The Main Compiler Function
@@ -37,7 +38,7 @@ compileExpression expr = case expr of
 
     -- Variables
     Core.Var n ->
-        let nameString = show n
+        let nameString = prettyShow n
         in HaskellCode
             { hsForward = nameString
             , hsBackward = nameString
