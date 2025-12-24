@@ -1,13 +1,13 @@
-module Language.Sparcl.Compiler where
+module Language.Sparcl.Compiler.Compiler where
 
-import qualified Language.Sparcl.Surface.Parsing as Parser
-import qualified Language.Sparcl.CompileHaskell  as Compiler
-import qualified Language.Sparcl.Core.Syntax     as Core
-import qualified Language.Sparcl.Surface.Syntax  as S
-import qualified Control.Monad.Reader            as Rd
-import qualified Language.Sparcl.Desugar         as Desugar
-import qualified Language.Sparcl.Typing.Typing   as Typing
-import qualified Language.Sparcl.Renaming        as Renaming
+import qualified Language.Sparcl.Surface.Parsing   as Parser
+import qualified Language.Sparcl.Compiler.Haskell  as HsCompiler
+import qualified Language.Sparcl.Core.Syntax       as Core
+import qualified Language.Sparcl.Surface.Syntax    as S
+import qualified Control.Monad.Reader              as Rd
+import qualified Language.Sparcl.Desugar           as Desugar
+import qualified Language.Sparcl.Typing.Typing     as Typing
+import qualified Language.Sparcl.Renaming          as Renaming
 
 import System.FilePath                    (takeBaseName)
 import Language.Sparcl.Name               (Name)
@@ -70,18 +70,10 @@ compileFile inputFile = do
 
     bindings <- Rd.runReaderT (runCompilerM $ desugarModuleToCore fileContent) env
 
-    let generatedDecls = map Compiler.compileBinding bindings
-
     let moduleName = takeBaseName inputFile
-    let haskellCode = unlines $
-          [ "module " ++ moduleName ++ " where"
-          , ""
-          , "main :: IO ()"
-          , "main = putStrLn \"This is placeholder code! I will replace later!\""
-          , ""
-          ] ++ generatedDecls
+    let (code, fileExtension) = HsCompiler.generateHaskellModule moduleName bindings
 
-    let outputFile = moduleName ++ ".hs"
-    writeFile outputFile haskellCode
+    let outputFile = moduleName ++ fileExtension
+    writeFile outputFile code
 
     putStrLn $ "Compiler: Success! Output written to: " ++ outputFile

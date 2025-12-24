@@ -1,7 +1,7 @@
 module Main where
 
 import           Language.Sparcl.REPL     (VerbosityLevel, startREPL)
-import           Language.Sparcl.Compiler (compileFile)
+import           Language.Sparcl.Compiler.Compiler (compileFile)
 
 import           System.Console.GetOpt
 import           System.Environment

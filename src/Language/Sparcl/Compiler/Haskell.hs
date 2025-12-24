@@ -1,4 +1,4 @@
-module Language.Sparcl.CompileHaskell where
+module Language.Sparcl.Compiler.Haskell where
 
 import qualified Language.Sparcl.Core.Syntax as Core
 import qualified Language.Sparcl.Name as Name
@@ -57,3 +57,16 @@ compileExpression expr = case expr of
             }
 
     _ -> error "compileExpression: Unimplemented constructor"
+
+
+generateHaskellModule :: String -> [(Name.Name, Core.Exp Name.Name)] -> (String, String)
+generateHaskellModule modName bindings =
+    let generatedDecls = map compileBinding bindings
+        haskellCode = unlines $
+              [ "module " ++ modName ++ " where"
+              , ""
+              , "main :: IO ()"
+              , "main = putStrLn \"This is placeholder code! I will replace later!\""
+              , ""
+              ] ++ generatedDecls
+    in (haskellCode, ".hs")

@@ -88,8 +88,8 @@ library
       Language.Sparcl.REPL
       Language.Sparcl.CodeGen.Haskell
       Language.Sparcl.TH
-      Language.Sparcl.CompileHaskell
-      Language.Sparcl.Compiler
+      Language.Sparcl.Compiler.Compiler
+      Language.Sparcl.Compiler.Haskell
 
   other-modules:
 
