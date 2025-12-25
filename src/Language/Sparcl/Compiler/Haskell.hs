@@ -67,7 +67,7 @@ generateHaskellModule modName bindings =
               [ "module " ++ modName ++ " where"
               , ""
               , "main :: IO ()"
-              , "main = putStrLn \"This is placeholder code! I will replace later!\""
+              , "main = putStrLn \"This is placeholder code! I will replace this later!\""
               , ""
               ] ++ generatedDecls
     in (haskellCode, ".hs")
