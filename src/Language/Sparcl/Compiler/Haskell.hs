@@ -5,13 +5,6 @@ import qualified Language.Sparcl.Name as Name
 import qualified Language.Sparcl.Literal as Literal
 import           Language.Sparcl.Pretty (prettyShow)
 
--- The type for the code output
-data HaskellCode = HaskellCode
-    { hsForward :: String
-    , hsBackward :: String
-    }
-    deriving (Show, Eq)
-
 -- Literals
 compileLiteral :: Literal.Literal -> String
 compileLiteral l = case l of
@@ -23,39 +16,23 @@ compileBinding :: (Name.Name, Core.Exp Name.Name) -> String
 compileBinding (name, expr) =
   let code = compileExpression expr
       nameStr = prettyShow name
-  in nameStr ++ " = " ++ hsForward code
+  in nameStr ++ " = " ++ code
 
 -- The Main Compiler Function
-compileExpression :: Core.Exp Name.Name -> HaskellCode
+compileExpression :: Core.Exp Name.Name -> String
 compileExpression expr = case expr of
     -- Literal values
-    Core.Lit l ->
-        let code = compileLiteral l
-        in HaskellCode
-            { hsForward = code
-            , hsBackward = code
-            }
+    Core.Lit l -> compileLiteral l
 
     -- Variables
-    Core.Var n ->
-        let nameString = prettyShow n
-        in HaskellCode
-            { hsForward = nameString
-            , hsBackward = nameString
-            }
+    Core.Var n -> prettyShow n
 
     -- Recursive compilation of the entire App
     Core.App e1 e2 ->
         let
             code1 = compileExpression e1
             code2 = compileExpression e2
-
-            fwdApp = "(" ++ hsForward code1 ++ " " ++ hsForward code2 ++ ")"
-            bwdApp = "(" ++ hsBackward code1 ++ " " ++ hsBackward code2 ++ ")"
-        in HaskellCode
-            { hsForward = fwdApp
-            , hsBackward = bwdApp
-            }
+        in "(" ++ code1 ++ " " ++ code2 ++ ")"
 
     _ -> error "compileExpression: Unimplemented constructor"
 
