@@ -27,6 +27,12 @@ compileExpression expr = case expr of
     -- Variables
     Core.Var n -> prettyShow n
 
+    -- Lambda Abstractions
+    Core.Abs n e ->
+        let varName  = prettyShow n
+            bodyCode = compileExpression e
+        in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
+
     -- Recursive compilation of the entire App
     Core.App e1 e2 ->
         let
