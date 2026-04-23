@@ -63,6 +63,13 @@ compileExpression expr = case expr of
             then cName
             else "(" ++ cName ++ " " ++ unwords args ++ ")"
 
+    -- Let bindings
+    Core.Let binds body ->
+        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileExpression e
+            bindsCode = map compileBind binds
+            bindsString = intercalate "; " bindsCode
+        in "(let { " ++ bindsString ++ " } in " ++ compileExpression body ++ ")"
+
     -- Case expressions
     Core.Case e alts ->
         let scrutinee = compileExpression e
