@@ -5,6 +5,7 @@ import qualified Language.Sparcl.Name as Name
 import qualified Language.Sparcl.Literal as Literal
 import           Language.Sparcl.Pretty (prettyShow)
 import           Data.List
+import           Language.Sparcl.Typing.Type (Ty)
 
 -- Literals
 compileLiteral :: Literal.Literal -> String
@@ -13,8 +14,8 @@ compileLiteral l = case l of
     _                   -> error "compileLiteral: Unhandled literal type"
 
 -- Top-level Bindings
-compileBinding :: (Name.Name, Core.Exp Name.Name) -> String
-compileBinding (name, expr) =
+compileBinding :: (Name.Name, Ty, Core.Exp Name.Name) -> String
+compileBinding (name, _ty, expr) =
   let code = compileExpression expr
       nameStr = prettyShow name
   in nameStr ++ " = " ++ code
@@ -88,7 +89,7 @@ compileExpression expr = case expr of
     _ -> error "compileExpression: Unimplemented constructor"
 
 
-generateHaskellModule :: String -> [(Name.Name, Core.Exp Name.Name)] -> (String, String)
+generateHaskellModule :: String -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
 generateHaskellModule modName bindings =
     let generatedDecls = map compileBinding bindings
         haskellCode = unlines $

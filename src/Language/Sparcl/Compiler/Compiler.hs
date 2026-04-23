@@ -17,6 +17,7 @@ import Control.Monad.Catch                (MonadThrow, MonadCatch, MonadMask)
 import Control.Monad.IO.Class             (MonadIO)
 import Language.Sparcl.DebugPrint         (KeyDebugLevel)
 import Language.Sparcl.Class              (Has(..), Local(..))
+import Language.Sparcl.Typing.Type        (Ty)
 
 data CompilerEnv = CompilerEnv
     { envDebugLevel    :: Int
@@ -35,7 +36,7 @@ instance Has KeyTC TypingContext CompilerM where
 instance Local KeyTC TypingContext CompilerM where
   local _ f (CompilerM m) = CompilerM $ Rd.local (\e -> e { envTypingContext = f (envTypingContext e) }) m
 
-desugarModuleToCore :: String -> CompilerM [(Name, Core.Exp Name)]
+desugarModuleToCore :: String -> CompilerM [(Name, Ty, Core.Exp Name)]
 desugarModuleToCore input = do
     let info = baseModuleInfo
 
@@ -58,7 +59,7 @@ desugarModuleToCore input = do
 
         Desugar.runDesugar $ Desugar.desugarTopDecls typedDecls
 
-    return [ (n, e) | (n, _ty, e) <- coreBindingsWithTypes ]
+    return coreBindingsWithTypes
 
 compileFile :: FilePath -> IO ()
 compileFile inputFile = do
