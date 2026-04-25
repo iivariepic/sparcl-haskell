@@ -32,9 +32,11 @@ compileBinding (name, ty, expr) =
   let nameStr = prettyShow name
   in if isReversible ty
     then
-        nameStr ++ " = error \"Reversible compilation not yet implemented for: " ++ nameStr ++ "\""
+        let fwdCode = compileForward expr
+            bwdCode = "error \"bwd pass not yet implemented for: " ++ nameStr ++ "\""
+        in nameStr ++ " = (" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
     else
-        let code = compileExpression expr
+        let code = compileForward expr
         in nameStr ++ " = " ++ code
 
 -- Patterns
@@ -58,9 +60,9 @@ translateConName name
 
     | otherwise = name
 
--- The Main Compiler Function
-compileExpression :: Core.Exp Name.Name -> String
-compileExpression expr = case expr of
+-- Compiling unidirectional or forward functions
+compileForward :: Core.Exp Name.Name -> String
+compileForward expr = case expr of
     -- Literal values
     Core.Lit l -> compileLiteral l
 
@@ -70,40 +72,64 @@ compileExpression expr = case expr of
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCode = compileExpression e
+            bodyCode = compileForward e
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors
-    Core.Con c es ->
-        let cName = translateConName (prettyShow c)
-            args = map compileExpression es
-        in if null args
-            then cName
-            else "(" ++ cName ++ " " ++ unwords args ++ ")"
+    Core.Con c es -> compileConstructor c es
+    Core.RCon c es -> compileConstructor c es
 
     -- Let bindings
     Core.Let binds body ->
-        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileExpression e
+        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward e
             bindsCode = map compileBind binds
             bindsString = intercalate "; " bindsCode
-        in "(let { " ++ bindsString ++ " } in " ++ compileExpression body ++ ")"
+        in "(let { " ++ bindsString ++ " } in " ++ compileForward body ++ ")"
 
     -- Case expressions
-    Core.Case e alts ->
-        let scrutinee = compileExpression e
-            compileAlt (p, body) =
-                "  " ++ compilePattern p ++ " -> " ++ compileExpression body
-            altsCode = map compileAlt alts
-        in "(case " ++ scrutinee ++ " of {\n" ++ unlines altsCode ++ "})"
+    Core.Case e alts   -> compileCase e alts
+    Core.RCase e rAlts ->
+        let alts = map (\(p, body, _pin) -> (p, body)) rAlts
+        in compileCase e alts
+
+    -- RPin
+    Core.RPin e1 _e2 ->
+        compileForward e1
+
+    -- Lift
+    Core.Lift e1 e2 ->
+        let fwdCode = compileForward e1
+            bwdCode = compileForward e2
+        in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
+
+    -- Unlift
+    Core.Unlift e -> compileForward e
 
     -- Recursive compilation of the entire App
     Core.App e1 e2 ->
         let
-            code1 = compileExpression e1
-            code2 = compileExpression e2
+            code1 = compileForward e1
+            code2 = compileForward e2
         in "(" ++ code1 ++ " " ++ code2 ++ ")"
 
-    _ -> error "compileExpression: Unimplemented constructor"
+    _ -> error "compileForward: Unimplemented constructor"
+
+    where
+        -- Shared logic for forward and unidirectional constructors
+        compileConstructor c es =
+            let cName = translateConName (prettyShow c)
+                args = map compileForward es
+            in if null args
+                then cName
+                else "(" ++ cName ++ " " ++ unwords args ++ ")"
+
+        -- Shared logic for forward and unidirectional cases
+        compileCase e alts =
+            let scrutinee = compileForward e
+                compileAlt (p, body) =
+                    "  " ++ compilePattern p ++ " -> " ++ compileForward body
+                altsCode = map compileAlt alts
+            in "(case " ++ scrutinee ++ " of {\n" ++ unlines altsCode ++ "})"
 
 
 generateHaskellModule :: String -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
