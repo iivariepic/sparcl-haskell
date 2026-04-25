@@ -27,16 +27,16 @@ isReversible ty = case ty of
     _ -> False
 
 -- Top-level Bindings
-compileBinding :: (Name.Name, Ty, Core.Exp Name.Name) -> String
-compileBinding (name, ty, expr) =
+compileBinding :: [String] -> (Name.Name, Ty, Core.Exp Name.Name) -> String
+compileBinding revNames (name, ty, expr) =
   let nameStr = prettyShow name
   in if isReversible ty
     then
-        let fwdCode = compileForward expr
+        let fwdCode = compileForward revNames expr
             bwdCode = "error \"bwd pass not yet implemented for: " ++ nameStr ++ "\""
         in nameStr ++ " = (" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
     else
-        let code = compileForward expr
+        let code = compileForward revNames expr
         in nameStr ++ " = " ++ code
 
 -- Patterns
@@ -61,18 +61,22 @@ translateConName name
     | otherwise = name
 
 -- Compiling unidirectional or forward functions
-compileForward :: Core.Exp Name.Name -> String
-compileForward expr = case expr of
+compileForward :: [String] -> Core.Exp Name.Name -> String
+compileForward revNames expr = case expr of
     -- Literal values
     Core.Lit l -> compileLiteral l
 
     -- Variables
-    Core.Var n -> prettyShow n
+    Core.Var n ->
+        let nameStr = prettyShow n
+        in if nameStr `elem` revNames
+            then "(fst " ++ nameStr ++ ")"
+            else nameStr
 
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCode = compileForward e
+            bodyCode = compileForward revNames e
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors
@@ -81,10 +85,10 @@ compileForward expr = case expr of
 
     -- Let bindings
     Core.Let binds body ->
-        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward e
+        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward revNames e
             bindsCode = map compileBind binds
             bindsString = intercalate "; " bindsCode
-        in "(let { " ++ bindsString ++ " } in " ++ compileForward body ++ ")"
+        in "(let { " ++ bindsString ++ " } in " ++ compileForward revNames body ++ ")"
 
     -- Case expressions
     Core.Case e alts   -> compileCase e alts
@@ -94,45 +98,47 @@ compileForward expr = case expr of
 
     -- RPin
     Core.RPin e1 _e2 ->
-        compileForward e1
+        compileForward revNames e1
 
     -- Lift
     Core.Lift e1 e2 ->
-        let fwdCode = compileForward e1
-            bwdCode = compileForward e2
+        let fwdCode = compileForward revNames e1
+            bwdCode = compileForward revNames e2
         in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
 
     -- Unlift
-    Core.Unlift e -> compileForward e
+    Core.Unlift e -> compileForward revNames e
 
     -- Recursive compilation of the entire App
     Core.App e1 e2 ->
         let
-            code1 = compileForward e1
-            code2 = compileForward e2
+            code1 = compileForward revNames e1
+            code2 = compileForward revNames e2
         in "(" ++ code1 ++ " " ++ code2 ++ ")"
 
     where
         -- Shared logic for forward and unidirectional constructors
         compileConstructor c es =
             let cName = translateConName (prettyShow c)
-                args = map compileForward es
+                args = map (compileForward revNames) es
             in if null args
                 then cName
                 else "(" ++ cName ++ " " ++ unwords args ++ ")"
 
         -- Shared logic for forward and unidirectional cases
         compileCase e alts =
-            let scrutinee = compileForward e
+            let scrutinee = compileForward revNames e
                 compileAlt (p, body) =
-                    "  " ++ compilePattern p ++ " -> " ++ compileForward body
+                    "  " ++ compilePattern p ++ " -> " ++ compileForward revNames body
                 altsCode = map compileAlt alts
             in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
 
 generateHaskellModule :: String -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
 generateHaskellModule modName bindings =
-    let generatedDecls = map compileBinding bindings
+    let
+        revNames = [ prettyShow n | (n, ty, _) <- bindings, isReversible ty ]
+        generatedDecls = map (compileBinding revNames) bindings
         haskellCode = unlines $
               [ "module " ++ modName ++ " where"
               , ""
