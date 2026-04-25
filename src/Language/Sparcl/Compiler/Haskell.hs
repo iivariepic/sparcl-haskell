@@ -5,6 +5,7 @@ import qualified Language.Sparcl.Name as Name
 import qualified Language.Sparcl.Literal as Literal
 import           Language.Sparcl.Pretty (prettyShow)
 import           Data.List
+import           Data.Char (toUpper)
 import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@))
 
 -- Literals
@@ -133,6 +134,10 @@ compileForward revNames expr = case expr of
                 altsCode = map compileAlt alts
             in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
+-- Helper function to capitalize first character of a string
+capitalize :: String -> String
+capitalize "" = ""
+capitalize (x:xs) = toUpper x : xs
 
 generateHaskellModule :: String -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
 generateHaskellModule modName bindings =
@@ -140,7 +145,7 @@ generateHaskellModule modName bindings =
         revNames = [ prettyShow n | (n, ty, _) <- bindings, isReversible ty ]
         generatedDecls = map (compileBinding revNames) bindings
         haskellCode = unlines $
-              [ "module " ++ modName ++ " where"
+              [ "module " ++ capitalize modName ++ " where"
               , ""
               , "main :: IO ()"
               , "main = putStrLn \"This is placeholder code! I will replace this later!\""
