@@ -112,8 +112,6 @@ compileForward expr = case expr of
             code2 = compileForward e2
         in "(" ++ code1 ++ " " ++ code2 ++ ")"
 
-    _ -> error "compileForward: Unimplemented constructor"
-
     where
         -- Shared logic for forward and unidirectional constructors
         compileConstructor c es =
