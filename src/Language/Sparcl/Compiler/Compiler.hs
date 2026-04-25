@@ -40,26 +40,24 @@ desugarModuleToCore :: String -> CompilerM [(Name, Ty, Core.Exp Name)]
 desugarModuleToCore input = do
     let info = baseModuleInfo
 
-    parsedModule <- case Parser.parseModule "<compiler>" input of
-                      Left err -> error $ "Parsing Error:\n" ++ err
-                      Right m  -> return m
+    let parsedModule = case Parser.parseModule "<compiler>" input of
+                        Left err -> error $ "Parsing Error:\n" ++ err
+                        Right m  -> m
 
     let (S.Module modName _ _ topDeclsParsed) = parsedModule
 
-    let (topDeclsRenamed, _dataDecls, _typeDecls, _boundVars, _opTable) =
+    let (topDeclsRenamed, dataDecls, typeDecls, _boundVars, _opTable) =
           case Renaming.runRenaming (miNameTable info) (miOpTable info)
                          (Renaming.renameTopDecls modName topDeclsParsed) of
                      Left err -> error $ "Renaming Error: " ++ show err
                      Right r  -> r
 
-    coreBindingsWithTypes <- runTC $
+    runTC $
       runTCWith (miConTable info) (miTypeTable info) (miSynTable info) $ do
-        res <- Typing.inferTopDecls topDeclsRenamed [] []
+        res <- Typing.inferTopDecls topDeclsRenamed dataDecls typeDecls
         let (typedDecls, _typeMap, _coreDDecls, _coreTDecls, _cTypeTable, _synTable) = res
 
         Desugar.runDesugar $ Desugar.desugarTopDecls typedDecls
-
-    return coreBindingsWithTypes
 
 compileFile :: FilePath -> IO ()
 compileFile inputFile = do
