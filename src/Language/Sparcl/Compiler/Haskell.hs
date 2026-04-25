@@ -5,7 +5,7 @@ import qualified Language.Sparcl.Name as Name
 import qualified Language.Sparcl.Literal as Literal
 import           Language.Sparcl.Pretty (prettyShow)
 import           Data.List
-import           Language.Sparcl.Typing.Type (Ty)
+import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@))
 
 -- Literals
 compileLiteral :: Literal.Literal -> String
@@ -13,12 +13,29 @@ compileLiteral l = case l of
     Literal.LitInt i    -> show i
     _                   -> error "compileLiteral: Unhandled literal type"
 
+-- Helper function to check if binding is reversible
+isReversible :: Ty -> Bool
+isReversible ty = case ty of
+    -- Check for -o linear arrow
+    (_ :-@ _) -> True
+    -- Check for 'rev' keyword
+    TyCon c _ | prettyShow c == "rev" -> True
+    -- Peel Check inner type for forall/polymorphism wrappers
+    TyForAll _ (TyQual _ innerTy) -> isReversible innerTy
+    -- Check inner type for type synonyms
+    TySyn _ innerTy -> isReversible innerTy
+    _ -> False
+
 -- Top-level Bindings
 compileBinding :: (Name.Name, Ty, Core.Exp Name.Name) -> String
-compileBinding (name, _ty, expr) =
-  let code = compileExpression expr
-      nameStr = prettyShow name
-  in nameStr ++ " = " ++ code
+compileBinding (name, ty, expr) =
+  let nameStr = prettyShow name
+  in if isReversible ty
+    then
+        nameStr ++ " = error \"Reversible compilation not yet implemented for: " ++ nameStr ++ "\""
+    else
+        let code = compileExpression expr
+        in nameStr ++ " = " ++ code
 
 -- Patterns
 compilePattern :: Core.Pat Name.Name -> String
