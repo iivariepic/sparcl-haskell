@@ -127,7 +127,7 @@ compileForward expr = case expr of
                 compileAlt (p, body) =
                     "  " ++ compilePattern p ++ " -> " ++ compileForward body
                 altsCode = map compileAlt alts
-            in "(case " ++ scrutinee ++ " of {\n" ++ unlines altsCode ++ "})"
+            in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
 
 generateHaskellModule :: String -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
