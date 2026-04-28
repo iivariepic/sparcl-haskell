@@ -134,19 +134,52 @@ compileForward revNames expr = case expr of
                 altsCode = map compileAlt alts
             in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
+-- Function to compile data declarations
+compileDDecl :: Core.DDecl Name.Name -> String
+compileDDecl (Core.DDecl dataName tyVars constructors) =
+    let
+        -- Data type name and type variables
+        nameStr = prettyShow dataName
+        tyVarStrs = unwords (map prettyShow tyVars)
+        -- Left-hand side of the equals sign
+        lhs = if null tyVars
+            then "data " ++ nameStr
+            else "data " ++ nameStr ++ " " ++ tyVarStrs
+        -- Helper function to compile a single constructor
+        compileCon (conName, _existentials, _constraints, argTypes) =
+            let cNameStr = translateConName (prettyShow conName)
+                -- wrap types in parentheses
+                formatArg ty =
+                    let typeStr = prettyShow ty
+                    in if ' ' `elem` typeStr && not ("(" `isPrefixOf` typeStr)
+                        then "(" ++ typeStr ++ ")"
+                        else typeStr
+
+                argsStr = unwords (map formatArg argTypes)
+            in if null argTypes
+                then cNameStr
+                else cNameStr ++ " " ++ argsStr
+        -- Right-hand side of the equals sign
+        rhs = intercalate " | " (map compileCon constructors)
+    in
+        lhs ++ " = " ++ rhs ++ " deriving Show"
+
 -- Helper function to capitalize first character of a string
 capitalize :: String -> String
 capitalize "" = ""
 capitalize (x:xs) = toUpper x : xs
 
-generateHaskellModule :: String -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
-generateHaskellModule modName bindings =
+generateHaskellModule :: String -> [Core.DDecl Name.Name] -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
+generateHaskellModule modName ddecls bindings =
     let
         revNames = [ prettyShow n | (n, ty, _) <- bindings, isReversible ty ]
         generatedDecls = map (compileBinding revNames) bindings
+        compiledDDecls = map compileDDecl ddecls
         haskellCode = unlines $
               [ "module " ++ capitalize modName ++ " where"
               , ""
+              ] ++ compiledDDecls ++
+              [ ""
               , "main :: IO ()"
               , "main = putStrLn \"This is placeholder code! I will replace this later!\""
               , ""

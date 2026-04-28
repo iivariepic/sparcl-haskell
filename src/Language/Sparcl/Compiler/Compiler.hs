@@ -36,7 +36,7 @@ instance Has KeyTC TypingContext CompilerM where
 instance Local KeyTC TypingContext CompilerM where
   local _ f (CompilerM m) = CompilerM $ Rd.local (\e -> e { envTypingContext = f (envTypingContext e) }) m
 
-desugarModuleToCore :: String -> CompilerM [(Name, Ty, Core.Exp Name)]
+desugarModuleToCore :: String -> CompilerM ([Core.DDecl Name], [(Name, Ty, Core.Exp Name)])
 desugarModuleToCore input = do
     let info = baseModuleInfo
 
@@ -55,9 +55,10 @@ desugarModuleToCore input = do
     runTC $
       runTCWith (miConTable info) (miTypeTable info) (miSynTable info) $ do
         res <- Typing.inferTopDecls topDeclsRenamed dataDecls typeDecls
-        let (typedDecls, _typeMap, _coreDDecls, _coreTDecls, _cTypeTable, _synTable) = res
+        let (typedDecls, _typeMap, coreDDecls, _coreTDecls, _cTypeTable, _synTable) = res
 
-        Desugar.runDesugar $ Desugar.desugarTopDecls typedDecls
+        coreBindings <- Desugar.runDesugar $ Desugar.desugarTopDecls typedDecls
+        return (coreDDecls, coreBindings)
 
 compileFile :: FilePath -> IO ()
 compileFile inputFile = do
@@ -67,10 +68,10 @@ compileFile inputFile = do
     tc <- initTypingContext
     let env = CompilerEnv { envDebugLevel = 0, envTypingContext = tc }
 
-    bindings <- Rd.runReaderT (runCompilerM $ desugarModuleToCore fileContent) env
+    (ddecls, bindings) <- Rd.runReaderT (runCompilerM $ desugarModuleToCore fileContent) env
 
     let moduleName = takeBaseName inputFile
-    let (code, fileExtension) = HsCompiler.generateHaskellModule moduleName bindings
+    let (code, fileExtension) = HsCompiler.generateHaskellModule moduleName ddecls bindings
 
     let outputFile = moduleName ++ fileExtension
     writeFile outputFile code
