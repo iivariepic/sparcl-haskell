@@ -17,7 +17,7 @@ import Control.Monad.Catch                (MonadThrow, MonadCatch, MonadMask)
 import Control.Monad.IO.Class             (MonadIO)
 import Language.Sparcl.DebugPrint         (KeyDebugLevel)
 import Language.Sparcl.Class              (Has(..), Local(..))
-import Language.Sparcl.Typing.Type        (Ty)
+import Language.Sparcl.Typing.Type        (Ty, PolyTy)
 
 data CompilerEnv = CompilerEnv
     { envDebugLevel    :: Int
@@ -36,7 +36,7 @@ instance Has KeyTC TypingContext CompilerM where
 instance Local KeyTC TypingContext CompilerM where
   local _ f (CompilerM m) = CompilerM $ Rd.local (\e -> e { envTypingContext = f (envTypingContext e) }) m
 
-desugarModuleToCore :: String -> CompilerM ([Core.DDecl Name], [(Name, Ty, Core.Exp Name)])
+desugarModuleToCore :: String -> CompilerM ([Core.DDecl Name], [(Name, Ty, Core.Exp Name)], [(Name, PolyTy)])
 desugarModuleToCore input = do
     let info = baseModuleInfo
 
@@ -55,10 +55,10 @@ desugarModuleToCore input = do
     runTC $
       runTCWith (miConTable info) (miTypeTable info) (miSynTable info) $ do
         res <- Typing.inferTopDecls topDeclsRenamed dataDecls typeDecls
-        let (typedDecls, _typeMap, coreDDecls, _coreTDecls, _cTypeTable, _synTable) = res
+        let (typedDecls, typeMap, coreDDecls, _coreTDecls, _cTypeTable, _synTable) = res
 
         coreBindings <- Desugar.runDesugar $ Desugar.desugarTopDecls typedDecls
-        return (coreDDecls, coreBindings)
+        return (coreDDecls, coreBindings, typeMap)
 
 compileFile :: FilePath -> IO ()
 compileFile inputFile = do
@@ -68,10 +68,10 @@ compileFile inputFile = do
     tc <- initTypingContext
     let env = CompilerEnv { envDebugLevel = 0, envTypingContext = tc }
 
-    (ddecls, bindings) <- Rd.runReaderT (runCompilerM $ desugarModuleToCore fileContent) env
+    (ddecls, bindings, typeMap) <- Rd.runReaderT (runCompilerM $ desugarModuleToCore fileContent) env
 
     let moduleName = takeBaseName inputFile
-    let (code, fileExtension) = HsCompiler.generateHaskellModule moduleName ddecls bindings
+    let (code, fileExtension) = HsCompiler.generateHaskellModule moduleName typeMap ddecls bindings
 
     let outputFile = moduleName ++ fileExtension
     writeFile outputFile code
