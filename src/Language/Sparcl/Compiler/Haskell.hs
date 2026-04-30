@@ -150,6 +150,20 @@ invertRHS typeMap revNames expr = case expr of
                      else "(" ++ cName ++ " " ++ unwords argPats ++ ")"
         in (patStr, modifier)
 
+    Core.RPin e1 _e2 ->
+        invertRHS typeMap revNames e1
+
+    Core.Con c es ->
+        let cName = translateConName (prettyShow c)
+            invertedArgs = map (invertRHS typeMap revNames) es
+            argPats = map fst invertedArgs
+            modifier = foldr (((.)) . snd) id invertedArgs
+            patStr = if null argPats
+                     then cName
+                     else "(" ++ cName ++ " " ++ unwords argPats ++ ")"
+
+        in (patStr, modifier)
+
     Core.Let binds body ->
         let (bodyPat, bodyMod) = invertRHS typeMap revNames body
             invertBind (n, _ty, e) =
@@ -272,7 +286,7 @@ compileBackward typeMap revNames expr = case expr of
             altsCode = map compileBwdAlt rAlts
         in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
-    -- RPin (backwards unimplemented)
+    -- RPin
     Core.RPin e1 _e2 ->
         compileBackward typeMap revNames e1
 
