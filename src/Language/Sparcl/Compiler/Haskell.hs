@@ -148,7 +148,18 @@ invertRHS revNames expr = case expr of
             patStr = if null argPats
                      then cName
                      else "(" ++ cName ++ " " ++ unwords argPats ++ ")"
-         in (patStr, modifier)
+        in (patStr, modifier)
+
+    Core.Let binds body ->
+        let (bodyPat, bodyMod) = invertRHS revNames body
+            invertBind (n, _ty, e) =
+                let (ePat, eMod) = invertRHS revNames e
+                    nName = prettyShow n
+                    bindMod rhs = "(let " ++ ePat ++ " = " ++ nName ++ " in " ++ eMod rhs ++ ")"
+                in bindMod
+            bindMods = map invertBind (reverse binds)
+            totalMod = foldr (.) id ([bodyMod] ++ bindMods)
+        in (bodyPat, totalMod)
 
     Core.App (Core.Var f) (Core.Var x) ->
         let fName = prettyShow f
@@ -188,7 +199,7 @@ compileBackward revNames expr = case expr of
     Core.Con c es -> compileConstructor c es
     Core.RCon c es -> compileConstructor c es
 
-    -- Let bindings (backwards unimplemented)
+    -- Let bindings
     Core.Let binds body ->
         let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileBackward revNames e
             bindsCode = map compileBind binds
