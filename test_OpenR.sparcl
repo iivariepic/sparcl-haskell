@@ -1,0 +1,2 @@
+sig pair : rev a -o rev b -o rev (a, b)
+def pair x y = rev (x , y)
