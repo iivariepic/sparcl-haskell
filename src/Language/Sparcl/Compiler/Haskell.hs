@@ -8,6 +8,12 @@ import           Data.List
 import           Data.Char (toUpper)
 import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@), PolyTy)
 
+-- Helper function to wrap symboling operators in parentheses
+formatName :: String -> String
+formatName s
+    | not (null s) && all (`elem` "!#$%&*+./<=>?@\\^|-~:") s = "(" ++ s ++ ")"
+    | otherwise = s
+
 -- Literals
 compileLiteral :: Literal.Literal -> String
 compileLiteral l = case l of
@@ -30,7 +36,8 @@ isReversible ty = case ty of
 -- Top-level Bindings
 compileBinding :: [(Name.Name, PolyTy)] -> [String] -> (Name.Name, Ty, Core.Exp Name.Name) -> String
 compileBinding typeMap revNames (name, ty, expr) =
-  let nameStr = prettyShow name
+  let rawName = prettyShow name
+      nameStr = formatName rawName
   in if isReversible ty
     then
         let fwdCode = compileForward revNames expr
@@ -69,7 +76,8 @@ compileForward revNames expr = case expr of
 
     -- Variables
     Core.Var n ->
-        let nameStr = prettyShow n
+        let rawName = prettyShow n
+            nameStr = formatName rawName
         in if nameStr `elem` revNames
             then "(fst " ++ nameStr ++ ")"
             else nameStr
@@ -138,7 +146,7 @@ compileForward revNames expr = case expr of
 -- Returns the pattern string and a function to wrap the body in let-bindings
 invertRHS :: [(Name.Name, PolyTy)] -> [String] -> Core.Exp Name.Name -> (String, String -> String)
 invertRHS typeMap revNames expr = case expr of
-    Core.Var n -> (prettyShow n, id)
+    Core.Var n -> (formatName (prettyShow n), id)
 
     Core.RCon c es ->
         let cName = translateConName (prettyShow c)
@@ -186,10 +194,11 @@ invertRHS typeMap revNames expr = case expr of
         in case unrollApp expr of
             (Core.Var f, args) ->
                 let fName = prettyShow f
+                    formattedFName = formatName fName
                     yName = "_y_" ++ fName -- safe variable name for the pattern
 
                     bwdCall = if fName `elem` revNames
-                          then "(snd " ++ fName ++ ")"
+                          then "(snd " ++ formattedFName ++ ")"
                           else fName
 
                     -- lookup function type in typemap
@@ -226,7 +235,7 @@ invertRHS typeMap revNames expr = case expr of
 
                     -- reversible variables
                     getVarName :: Core.Exp Name.Name -> String
-                    getVarName (Core.Var n) = prettyShow n
+                    getVarName (Core.Var n) = formatName (prettyShow n)
                     getVarName _            = "error_expected_var"
 
                     revArgsNames = map getVarName revArgs
@@ -250,7 +259,8 @@ compileBackward typeMap revNames expr = case expr of
 
     -- Variables
     Core.Var n ->
-        let nameStr = prettyShow n
+        let rawName = prettyShow n
+            nameStr = formatName rawName
         in if nameStr `elem` revNames
             then "(snd " ++ nameStr ++ ")"
             else nameStr
@@ -367,6 +377,7 @@ generateHaskellModule modName typeMap ddecls bindings =
         haskellCode = unlines $
               [ "module " ++ capitalize modName ++ " where"
               , ""
+              , "import Prelude hiding (fst, snd, (.))"
               ] ++ compiledDDecls ++
               [ ""
               , "main :: IO ()"
