@@ -8,6 +8,12 @@ import           Data.List
 import           Data.Char (toUpper)
 import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@), PolyTy)
 
+-- Data type for the context of the compiler
+data CompilerContext =  CompilerContext
+    { ctxTypeMap  :: [(Name.Name, PolyTy)]
+    , ctxRevNames :: [String]
+    }
+
 -- Helper function to wrap symboling operators in parentheses
 formatName :: String -> String
 formatName s
@@ -34,17 +40,17 @@ isReversible ty = case ty of
     _ -> False
 
 -- Top-level Bindings
-compileBinding :: [(Name.Name, PolyTy)] -> [String] -> (Name.Name, Ty, Core.Exp Name.Name) -> String
-compileBinding typeMap revNames (name, ty, expr) =
+compileBinding :: CompilerContext -> (Name.Name, Ty, Core.Exp Name.Name) -> String
+compileBinding ctx (name, ty, expr) =
   let rawName = prettyShow name
       nameStr = formatName rawName
   in if isReversible ty
     then
-        let fwdCode = compileForward revNames expr
-            bwdCode = compileBackward typeMap revNames expr
+        let fwdCode = compileForward ctx expr
+            bwdCode = compileBackward ctx expr
         in nameStr ++ " = (" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
     else
-        let code = compileForward revNames expr
+        let code = compileForward ctx expr
         in nameStr ++ " = " ++ code
 
 -- Patterns
@@ -69,8 +75,8 @@ translateConName name
     | otherwise = name
 
 -- Compiling unidirectional or forward functions
-compileForward :: [String] -> Core.Exp Name.Name -> String
-compileForward revNames expr = case expr of
+compileForward :: CompilerContext -> Core.Exp Name.Name -> String
+compileForward ctx expr = case expr of
     -- Literal values
     Core.Lit l -> compileLiteral l
 
@@ -78,14 +84,14 @@ compileForward revNames expr = case expr of
     Core.Var n ->
         let rawName = prettyShow n
             nameStr = formatName rawName
-        in if nameStr `elem` revNames
+        in if nameStr `elem` ctxRevNames ctx
             then "(fst " ++ nameStr ++ ")"
             else nameStr
 
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCode = compileForward revNames e
+            bodyCode = compileForward ctx e
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors
@@ -94,10 +100,10 @@ compileForward revNames expr = case expr of
 
     -- Let bindings
     Core.Let binds body ->
-        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward revNames e
+        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward ctx e
             bindsCode = map compileBind binds
             bindsString = intercalate "; " bindsCode
-        in "(let { " ++ bindsString ++ " } in " ++ compileForward revNames body ++ ")"
+        in "(let { " ++ bindsString ++ " } in " ++ compileForward ctx body ++ ")"
 
     -- Case expressions
     Core.Case e alts   -> compileCase e alts
@@ -107,50 +113,50 @@ compileForward revNames expr = case expr of
 
     -- RPin
     Core.RPin e1 _e2 ->
-        compileForward revNames e1
+        compileForward ctx e1
 
     -- Lift
     Core.Lift e1 e2 ->
-        let fwdCode = compileForward revNames e1
-            bwdCode = compileForward revNames e2
+        let fwdCode = compileForward ctx e1
+            bwdCode = compileForward ctx e2
         in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
 
     -- Unlift
-    Core.Unlift e -> compileForward revNames e
+    Core.Unlift e -> compileForward ctx e
 
     -- Recursive compilation of the entire function App
     Core.App e1 e2 ->
         let
-            code1 = compileForward revNames e1
-            code2 = compileForward revNames e2
+            code1 = compileForward ctx e1
+            code2 = compileForward ctx e2
         in "(" ++ code1 ++ " " ++ code2 ++ ")"
 
     where
         -- Shared logic for forward and unidirectional constructors
         compileConstructor c es =
             let cName = translateConName (prettyShow c)
-                args = map (compileForward revNames) es
+                args = map (compileForward ctx) es
             in if null args
                 then cName
                 else "(" ++ cName ++ " " ++ unwords args ++ ")"
 
         -- Shared logic for forward and unidirectional cases
         compileCase e alts =
-            let scrutinee = compileForward revNames e
+            let scrutinee = compileForward ctx e
                 compileAlt (p, body) =
-                    "  " ++ compilePattern p ++ " -> " ++ compileForward revNames body
+                    "  " ++ compilePattern p ++ " -> " ++ compileForward ctx body
                 altsCode = map compileAlt alts
             in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
 -- Helper function to invert a forward expression into a backward pattern
 -- Returns the pattern string and a function to wrap the body in let-bindings
-invertRHS :: [(Name.Name, PolyTy)] -> [String] -> Core.Exp Name.Name -> (String, String -> String)
-invertRHS typeMap revNames expr = case expr of
+invertRHS :: CompilerContext -> Core.Exp Name.Name -> (String, String -> String)
+invertRHS ctx expr = case expr of
     Core.Var n -> (formatName (prettyShow n), id)
 
     Core.RCon c es ->
         let cName = translateConName (prettyShow c)
-            invertedArgs = map (invertRHS typeMap revNames) es
+            invertedArgs = map (invertRHS ctx) es
             argPats = map fst invertedArgs
             modifier = foldr (((.)) . snd) id invertedArgs
             patStr = if null argPats
@@ -159,11 +165,11 @@ invertRHS typeMap revNames expr = case expr of
         in (patStr, modifier)
 
     Core.RPin e1 _e2 ->
-        invertRHS typeMap revNames e1
+        invertRHS ctx e1
 
     Core.Con c es ->
         let cName = translateConName (prettyShow c)
-            invertedArgs = map (invertRHS typeMap revNames) es
+            invertedArgs = map (invertRHS ctx) es
             argPats = map fst invertedArgs
             modifier = foldr (((.)) . snd) id invertedArgs
             patStr = if null argPats
@@ -173,9 +179,9 @@ invertRHS typeMap revNames expr = case expr of
         in (patStr, modifier)
 
     Core.Let binds body ->
-        let (bodyPat, bodyMod) = invertRHS typeMap revNames body
+        let (bodyPat, bodyMod) = invertRHS ctx body
             invertBind (n, _ty, e) =
-                let (ePat, eMod) = invertRHS typeMap revNames e
+                let (ePat, eMod) = invertRHS ctx e
                     nName = prettyShow n
                     bindMod rhs = "(let " ++ ePat ++ " = " ++ nName ++ " in " ++ eMod rhs ++ ")"
                 in bindMod
@@ -197,12 +203,12 @@ invertRHS typeMap revNames expr = case expr of
                     formattedFName = formatName fName
                     yName = "_y_" ++ fName -- safe variable name for the pattern
 
-                    bwdCall = if fName `elem` revNames
+                    bwdCall = if fName `elem` ctxRevNames ctx
                           then "(snd " ++ formattedFName ++ ")"
                           else fName
 
                     -- lookup function type in typemap
-                    fTy = case lookup f typeMap of
+                    fTy = case lookup f (ctxTypeMap ctx) of
                             Just ty -> ty
                             Nothing -> error $ "Type not found for function: " ++ fName
 
@@ -228,7 +234,7 @@ invertRHS typeMap revNames expr = case expr of
                     revArgs = [ arg | (arg, isRev) <- zippedArgs, isRev ]
 
                     -- forward context arguments
-                    fwdArgsCode = map (compileForward revNames) fwdArgs
+                    fwdArgsCode = map (compileForward ctx) fwdArgs
                     callStr = if null fwdArgsCode
                               then bwdCall ++ " " ++ yName
                               else bwdCall ++ " " ++ unwords fwdArgsCode ++ " " ++ yName
@@ -252,8 +258,8 @@ invertRHS typeMap revNames expr = case expr of
 
 
 -- Compiling backward functions
-compileBackward :: [(Name.Name, PolyTy)] -> [String] -> Core.Exp Name.Name -> String
-compileBackward typeMap revNames expr = case expr of
+compileBackward :: CompilerContext -> Core.Exp Name.Name -> String
+compileBackward ctx expr = case expr of
     -- Literal values
     Core.Lit l -> compileLiteral l
 
@@ -261,14 +267,14 @@ compileBackward typeMap revNames expr = case expr of
     Core.Var n ->
         let rawName = prettyShow n
             nameStr = formatName rawName
-        in if nameStr `elem` revNames
+        in if nameStr `elem` ctxRevNames ctx
             then "(snd " ++ nameStr ++ ")"
             else nameStr
 
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCode = compileBackward typeMap revNames e
+            bodyCode = compileBackward ctx e
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors (backwards unimplemented)
@@ -277,19 +283,19 @@ compileBackward typeMap revNames expr = case expr of
 
     -- Let bindings
     Core.Let binds body ->
-        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileBackward typeMap revNames e
+        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileBackward ctx e
             bindsCode = map compileBind binds
             bindsString = intercalate "; " bindsCode
-        in "(let { " ++ bindsString ++ " } in " ++ compileBackward typeMap revNames body ++ ")"
+        in "(let { " ++ bindsString ++ " } in " ++ compileBackward ctx body ++ ")"
 
     -- Case expressions
     Core.Case e alts   -> compileCase e alts
     Core.RCase e rAlts ->
-        let scrutinee = compileBackward typeMap revNames e
+        let scrutinee = compileBackward ctx e
 
             -- Helper function to swap forward output and forward pattern
             compileBwdAlt (fwdPat, fwdBody, _pin) =
-                let (patStr, modifier) = invertRHS typeMap revNames fwdBody
+                let (patStr, modifier) = invertRHS ctx fwdBody
                     bwdRhs = modifier (compilePattern fwdPat)
                 in "  " ++ patStr ++ " -> " ++ bwdRhs
 
@@ -298,38 +304,38 @@ compileBackward typeMap revNames expr = case expr of
 
     -- RPin
     Core.RPin e1 _e2 ->
-        compileBackward typeMap revNames e1
+        compileBackward ctx e1
 
     -- Lift (backwards unimplemented)
     Core.Lift e1 e2 ->
-        let fwdCode = compileBackward typeMap revNames e1
-            bwdCode = compileBackward typeMap revNames e2
+        let fwdCode = compileBackward ctx e1
+            bwdCode = compileBackward ctx e2
         in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
 
     -- Unlift (backwards unimplemented)
-    Core.Unlift e -> compileBackward typeMap revNames e
+    Core.Unlift e -> compileBackward ctx e
 
     -- Recursive compilation of the entire function App (backwards unimplemented)
     Core.App e1 e2 ->
         let
-            code1 = compileBackward typeMap revNames e1
-            code2 = compileBackward typeMap revNames e2
+            code1 = compileBackward ctx e1
+            code2 = compileBackward ctx e2
         in "(" ++ code1 ++ " " ++ code2 ++ ")"
 
     where
         -- Shared logic for forward and unidirectional constructors
         compileConstructor c es =
             let cName = translateConName (prettyShow c)
-                args = map (compileBackward typeMap revNames) es
+                args = map (compileBackward ctx) es
             in if null args
                 then cName
                 else "(" ++ cName ++ " " ++ unwords args ++ ")"
 
         -- Shared logic for forward and unidirectional cases
         compileCase e alts =
-            let scrutinee = compileBackward typeMap revNames e
+            let scrutinee = compileBackward ctx e
                 compileAlt (p, body) =
-                    "  " ++ compilePattern p ++ " -> " ++ compileBackward typeMap revNames body
+                    "  " ++ compilePattern p ++ " -> " ++ compileBackward ctx body
                 altsCode = map compileAlt alts
             in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
@@ -372,7 +378,11 @@ generateHaskellModule :: String -> [(Name.Name, PolyTy)] -> [Core.DDecl Name.Nam
 generateHaskellModule modName typeMap ddecls bindings =
     let
         revNames = [ prettyShow n | (n, ty, _) <- bindings, isReversible ty ]
-        generatedDecls = map (compileBinding typeMap revNames) bindings
+        initCtx = CompilerContext
+                    { ctxTypeMap  = typeMap
+                    , ctxRevNames = revNames
+                    }
+        generatedDecls = map (compileBinding initCtx) bindings
         compiledDDecls = map compileDDecl ddecls
         haskellCode = unlines $
               [ "module " ++ capitalize modName ++ " where"
