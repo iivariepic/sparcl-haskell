@@ -103,7 +103,12 @@ compileForward ctx expr = case expr of
         let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward ctx e
             bindsCode = map compileBind binds
             bindsString = intercalate "; " bindsCode
-        in "(let { " ++ bindsString ++ " } in " ++ compileForward ctx body ++ ")"
+
+            -- Add local bindings to reversible names
+            newRevs = [ formatName (prettyShow n) | (n, ty, _) <- binds, isReversible ty ]
+            bodyCtx = ctx { ctxRevNames = ctxRevNames ctx ++ newRevs }
+
+        in "(let { " ++ bindsString ++ " } in " ++ compileForward bodyCtx body ++ ")"
 
     -- Case expressions
     Core.Case e alts   -> compileCase e alts
@@ -179,12 +184,17 @@ invertRHS ctx expr = case expr of
         in (patStr, modifier)
 
     Core.Let binds body ->
-        let (bodyPat, bodyMod) = invertRHS ctx body
+        let newRevs = [ formatName (prettyShow n) | (n, ty, _) <- binds, isReversible ty ]
+            bodyCtx = ctx { ctxRevNames = ctxRevNames ctx ++ newRevs }
+
+            (bodyPat, bodyMod) = invertRHS bodyCtx body
+
             invertBind (n, _ty, e) =
                 let (ePat, eMod) = invertRHS ctx e
                     nName = prettyShow n
                     bindMod rhs = "(let " ++ ePat ++ " = " ++ nName ++ " in " ++ eMod rhs ++ ")"
                 in bindMod
+
             bindMods = map invertBind (reverse binds)
             totalMod = foldr (.) id (bodyMod : bindMods)
         in (bodyPat, totalMod)
@@ -286,7 +296,12 @@ compileBackward ctx expr = case expr of
         let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileBackward ctx e
             bindsCode = map compileBind binds
             bindsString = intercalate "; " bindsCode
-        in "(let { " ++ bindsString ++ " } in " ++ compileBackward ctx body ++ ")"
+
+            -- Add local bindings to reversible names
+            newRevs = [ formatName (prettyShow n) | (n, ty, _) <- binds, isReversible ty ]
+            bodyCtx = ctx { ctxRevNames = ctxRevNames ctx ++ newRevs }
+
+        in "(let { " ++ bindsString ++ " } in " ++ compileBackward bodyCtx body ++ ")"
 
     -- Case expressions
     Core.Case e alts   -> compileCase e alts
