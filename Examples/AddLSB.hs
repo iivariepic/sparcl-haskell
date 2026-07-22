@@ -118,6 +118,6 @@ n6 = fwd inc n5
 n7 = fwd inc n6
 
 add43 = (fwd add) B0 n3 n4
-sub73 = (bwd add) B0 n4 n7
+sub73 = (bwd add) B0 n3 n7
 
 add5 as = (fwd add) B0 as n5

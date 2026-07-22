@@ -34,10 +34,12 @@ formatName s
 
 -- Helper to determine if an expression is a reversible pair that needs projection
 needsProjection :: CompilerContext -> Core.Exp Name.Name -> Bool
-needsProjection ctx (Core.Var n) = case lookup n (ctxEnv ctx) of
-    Just LinearReversible -> True
-    _                     -> False
--- We can expand this later if more complex expressions return reversible pairs
+needsProjection ctx (Core.Var n) =
+    case lookup n (ctxEnv ctx) of
+        Just LinearReversible -> True
+        Just PureCopyable -> False
+        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx))
+needsProjection _ (Core.App _ _) = False
 needsProjection _ _ = False
 
 -- Literals
@@ -49,15 +51,23 @@ compileLiteral l = case l of
 -- Helper function to check if binding is reversible
 isReversible :: Ty -> Bool
 isReversible ty = case ty of
-    -- Check for -o linear arrow
     (_ :-@ _) -> True
-    -- Check for 'rev' keyword
     TyCon c _ | prettyShow c == "rev" -> True
-    -- Peel Check inner type for forall/polymorphism wrappers
     TyForAll _ (TyQual _ innerTy) -> isReversible innerTy
-    -- Check inner type for type synonyms
     TySyn _ innerTy -> isReversible innerTy
-    _ -> False
+    -- Catch types that return reversible functions (e.g., Bit -> rev L -o L)
+    _ -> "-o" `isInfixOf` prettyShow ty || "rev" `isInfixOf` prettyShow ty
+
+-- Helper to check if an application chain belongs to a reversible function
+isReversibleAppChain :: CompilerContext -> Core.Exp Name.Name -> Bool
+isReversibleAppChain ctx (Core.Var n) =
+    case lookup n (ctxEnv ctx) of
+        Just LinearReversible -> True
+        Just PureCopyable -> False
+        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx))
+isReversibleAppChain ctx (Core.App e1 _) = isReversibleAppChain ctx e1
+isReversibleAppChain ctx (Core.RPin e1 _) = isReversibleAppChain ctx e1
+isReversibleAppChain _ _ = False
 
 -- Top-level Bindings
 compileBinding :: CompilerContext -> (Name.Name, Ty, Core.Exp Name.Name) -> String
@@ -167,7 +177,7 @@ compileForward ctx expr = case expr of
     -- Lift
     Core.Lift e1 e2 ->
         let fwdCode = compileForward ctx e1
-            bwdCode = compileForward ctx e2
+            bwdCode = compileBackward ctx e2
         in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
 
     -- Unlift
@@ -175,12 +185,22 @@ compileForward ctx expr = case expr of
 
     -- Recursive compilation of the entire function App
     Core.App e1 e2 ->
-        let
-            code1 = compileForward ctx e1
-            code2 = compileForward ctx e2
-        in if needsProjection ctx e1
-            then "((fst " ++ code1 ++ ") " ++ code2 ++ ")"
-            else "(" ++ code1 ++ " " ++ code2 ++ ")"
+        case e1 of
+            -- Intercept native 'fwd' and 'bwd' commands to bypass tuple expectations dynamically
+            Core.Var f | prettyShow f == "fwd" ->
+                let code = compileForward ctx e2
+                in if needsProjection ctx e2 then "(fst " ++ code ++ ")" else code
+            Core.Var f | prettyShow f == "bwd" ->
+                let code = compileForward ctx e2
+                in if needsProjection ctx e2 then "(snd " ++ code ++ ")" else compileBackward ctx e2
+
+            -- Standard application fallback
+            _ ->
+                let code1 = compileForward ctx e1
+                    code2 = compileForward ctx e2
+                in if needsProjection ctx e1
+                    then "((fst " ++ code1 ++ ") " ++ code2 ++ ")"
+                    else "(" ++ code1 ++ " " ++ code2 ++ ")"
 
     where
         -- Shared logic for forward and unidirectional constructors
@@ -204,22 +224,30 @@ compileForward ctx expr = case expr of
 -- Compiling backward functions
 compileBackward :: CompilerContext -> Core.Exp Name.Name -> String
 compileBackward ctx expr = case expr of
+
+    -- Variables in backward evaluation
+    Core.Var n ->
+        case lookup n (ctxEnv ctx) of
+            Just PureCopyable -> "(\\_v -> _v)"
+            Just LinearReversible -> formatName (prettyShow n)
+            Nothing ->
+                if needsProjection ctx expr then
+                    formatName (prettyShow n)
+                else
+                    "(\\_v -> _v)"
+
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCtx  = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx }
-            bodyCode = compileBackward bodyCtx e
+            bodyCode = compileBackward ctx e
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors
-    Core.Con c es -> compileConstructor c es
     Core.RCon c es ->
             let cName = translateConName (prettyShow c)
-                -- Generate names for the unpacked constructor variables (_v1, _v2, ...)
                 vars  = [ "_v" ++ show i | i <- [1..length es] ]
                 pat   = if null vars then cName else "(" ++ cName ++ " " ++ unwords vars ++ ")"
 
-                -- Project 'snd' if the argument expression is a linear variable pair
                 compileArg e v =
                     let code = compileBackward ctx e
                     in if needsProjection ctx e
@@ -235,13 +263,12 @@ compileBackward ctx expr = case expr of
 
     -- Let bindings
     Core.Let binds body ->
-        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileBackward ctx e
+        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward ctx e
             bindsCode = map compileBind binds
             bindsString = intercalate "; " bindsCode
 
-            -- Add local bindings to the environment \Gamma and \Theta
-            newEnvBindings = [ (n, if isReversible ty then LinearReversible else PureCopyable)
-                             | (n, ty, _) <- binds ]
+            newEnvBindings = [ (n, LinearReversible)
+                             | (n, ty, _) <- binds, isReversible ty ]
             bodyCtx = ctx { ctxEnv = newEnvBindings ++ ctxEnv ctx }
 
         in "(let { " ++ bindsString ++ " } in " ++ compileBackward bodyCtx body ++ ")"
@@ -263,57 +290,65 @@ compileBackward ctx expr = case expr of
 
     -- Recursive compilation of the entire function App
     Core.App e1 e2 ->
-        let
-            code1 = compileBackward ctx e1
-            code2 = compileBackward ctx e2
-        in if needsProjection ctx e1
-            then "((snd " ++ code1 ++ ") " ++ code2 ++ ")"
-            else "(" ++ code1 ++ " " ++ code2 ++ ")"
-
-    -- Case expressions
-    Core.Case e alts -> compileCase e alts
+        case e1 of
+            Core.Abs _ _ ->
+                let code1 = compileBackward ctx e1
+                    code2 = compileForward ctx e2
+                in "(" ++ code1 ++ " " ++ code2 ++ ")"
+            _ ->
+                if isReversibleAppChain ctx e1 then
+                    let code1 = compileBackward ctx e1
+                        code2 = compileForward ctx e2
+                    in if needsProjection ctx e1 then
+                        "((snd " ++ code1 ++ ") " ++ code2 ++ ")"
+                    else
+                        "(" ++ code1 ++ " " ++ code2 ++ ")"
+                else
+                    compileForward ctx expr
 
     -- Reversible Case expressions (Backwards)
     Core.RCase e rAlts ->
         let scrutBwd = compileBackward ctx e
-            -- Feeds the unwound branch result back into the scrutinee's backward pass
+            scrutFwd = let code = compileForward ctx e
+                       in if needsProjection ctx e then "(fst " ++ code ++ ")" else code
+
             scrutCall bwdVal = if needsProjection ctx e
                                then "((snd " ++ scrutBwd ++ ") " ++ bwdVal ++ ")"
                                else "(" ++ scrutBwd ++ " " ++ bwdVal ++ ")"
 
-            -- Recursively construct the conditional if-then-else chain using the branch pins
             buildIfChain [] = "error \"No matching pin found during inversion in rcase\""
             buildIfChain ((p, body, pin):rest) =
-                let pinCode   = compileForward ctx pin -- Pins are pure, forward predicates
+                let pinCode   = compileForward ctx pin
                     pVars     = patVars p
                     bodyCtx   = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
                     bodyBwd   = compileBackward bodyCtx body
-                    branchVal = "(" ++ bodyBwd ++ ") _v"
+
+                    upPat     = buildTuplePat body
+
+                    branchVal = "(case " ++ scrutFwd ++ " of { " ++ compilePattern p ++ " -> " ++
+                                "let " ++ upPat ++ " = (" ++ bodyBwd ++ ") _v in " ++
+                                compilePattern p ++ "; _ -> error \"unreachable rcase pattern\" })"
+
                 in "if (" ++ pinCode ++ ") _v then " ++ scrutCall branchVal ++ " else " ++ buildIfChain rest
         in "(\\_v -> " ++ buildIfChain rAlts ++ ")"
 
-    -- If use functionality of compileForward if there is no separate need
     _ -> compileForward ctx expr
 
-
-    where
-        -- Shared logic for forward and unidirectional constructors
-        compileConstructor c es =
-            let cName = translateConName (prettyShow c)
-                args = map (compileBackward ctx) es
-            in if null args
-                then cName
-                else "(" ++ cName ++ " " ++ unwords args ++ ")"
-
-        -- Helper function to compile backward case
-        compileCase e alts =
-            let scrutinee = compileBackward ctx e
-                compileAlt (p, body) =
-                    let pVars   = patVars p
-                        bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                    in "  " ++ compilePattern p ++ " -> " ++ compileBackward bodyCtx body
-                altsCode = map compileAlt alts
-            in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
+-- Helper to build a tuple pattern mapping the backward output of an expression
+buildTuplePat :: Core.Exp Name.Name -> String
+buildTuplePat expr = case expr of
+    Core.Var n -> formatName (prettyShow n)
+    Core.RCon _ es ->
+        let pats = map buildTuplePat es
+        in case pats of
+            []  -> "()"
+            [p] -> p
+            _   -> "(" ++ intercalate ", " pats ++ ")"
+    Core.App _ e2 -> buildTuplePat e2     -- App backward returns the updated argument (e2)
+    Core.RPin e1 _ -> buildTuplePat e1
+    Core.Lift _ e2 -> buildTuplePat e2
+    Core.Let _ body -> buildTuplePat body
+    _ -> "_"
 
 -- Function to compile data declarations
 compileDDecl :: Core.DDecl Name.Name -> String
