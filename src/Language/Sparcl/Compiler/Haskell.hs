@@ -82,7 +82,8 @@ compileBinding ctx (name, ty, expr) =
     then
         let fwdCode = compileForward initBodyCtx expr
             bwdCode = compileBackward initBodyCtx expr
-        in nameStr ++ " = (" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
+        in nameStr ++ " = (" ++ nameStr ++ "_fwd , " ++ nameStr ++ "_bwd)\n"
+        ++ nameStr ++ "_fwd = (" ++ fwdCode ++ ")\n" ++ nameStr ++ "_bwd = (" ++ bwdCode ++ ")"
     else
         let code = compileForward initBodyCtx expr
         in nameStr ++ " = " ++ code
@@ -125,16 +126,22 @@ compileForward ctx expr = case expr of
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors
-    Core.Con c es -> compileConstructor c es
+    Core.Con c es ->
+        let cName = translateConName (prettyShow c)
+            args = map (compileForward ctx) es
+        in if null args
+            then cName
+            else "(" ++ cName ++ " " ++ unwords args ++ ")"
+
     Core.RCon c es ->
-            let cName = translateConName (prettyShow c)
-                compileArg e =
-                    let code = compileForward ctx e
-                    in if needsProjection ctx e
-                       then "(fst " ++ code ++ ")"
-                       else code
-                args = map compileArg es
-            in if null args then cName else "(" ++ cName ++ " " ++ unwords args ++ ")"
+        let cName = translateConName (prettyShow c)
+            compileArg e =
+                let code = compileForward ctx e
+                in if needsProjection ctx e
+                   then code ++ "_fwd"
+                   else code
+            args = map compileArg es
+        in if null args then cName else "(" ++ cName ++ " " ++ unwords args ++ ")"
 
     -- Let bindings
     Core.Let binds body ->
@@ -150,13 +157,20 @@ compileForward ctx expr = case expr of
         in "(let { " ++ bindsString ++ " } in " ++ compileForward bodyCtx body ++ ")"
 
     -- Case expressions
-    Core.Case e alts -> compileCase e alts
+    Core.Case e alts ->
+        let scrutinee = compileForward ctx e
+            compileAlt (p, body) =
+                let pVars   = patVars p
+                    bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
+                in "  " ++ compilePattern p ++ " -> " ++ compileForward bodyCtx body
+            altsCode = map compileAlt alts
+        in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
     -- Reversible Case expressions
     Core.RCase e rAlts ->
         let scrutCode = compileForward ctx e
             scrutVal  = if needsProjection ctx e
-                        then "(fst " ++ scrutCode ++ ")"
+                        then scrutCode ++ "_fwd"
                         else scrutCode
 
             compileAlt (p, body, _pin) =
@@ -185,41 +199,11 @@ compileForward ctx expr = case expr of
 
     -- Recursive compilation of the entire function App
     Core.App e1 e2 ->
-        case e1 of
-            -- Intercept native 'fwd' and 'bwd' commands to bypass tuple expectations dynamically
-            Core.Var f | prettyShow f == "fwd" ->
-                let code = compileForward ctx e2
-                in if needsProjection ctx e2 then "(fst " ++ code ++ ")" else code
-            Core.Var f | prettyShow f == "bwd" ->
-                let code = compileForward ctx e2
-                in if needsProjection ctx e2 then "(snd " ++ code ++ ")" else compileBackward ctx e2
-
-            -- Standard application fallback
-            _ ->
-                let code1 = compileForward ctx e1
-                    code2 = compileForward ctx e2
-                in if needsProjection ctx e1
-                    then "((fst " ++ code1 ++ ") " ++ code2 ++ ")"
-                    else "(" ++ code1 ++ " " ++ code2 ++ ")"
-
-    where
-        -- Shared logic for forward and unidirectional constructors
-        compileConstructor c es =
-            let cName = translateConName (prettyShow c)
-                args = map (compileForward ctx) es
-            in if null args
-                then cName
-                else "(" ++ cName ++ " " ++ unwords args ++ ")"
-
-        -- Helper function to compile a case
-        compileCase e alts =
-            let scrutinee = compileForward ctx e
-                compileAlt (p, body) =
-                    let pVars   = patVars p
-                        bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                    in "  " ++ compilePattern p ++ " -> " ++ compileForward bodyCtx body
-                altsCode = map compileAlt alts
-            in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
+        let code1 = compileForward ctx e1
+            code2 = compileForward ctx e2
+        in if needsProjection ctx e1
+            then "(" ++ code1 ++ "_fwd " ++ code2 ++ ")"
+            else "(" ++ code1 ++ " " ++ code2 ++ ")"
 
 -- Compiling backward functions
 compileBackward :: CompilerContext -> Core.Exp Name.Name -> String
@@ -251,7 +235,7 @@ compileBackward ctx expr = case expr of
                 compileArg e v =
                     let code = compileBackward ctx e
                     in if needsProjection ctx e
-                       then "((snd " ++ code ++ ") " ++ v ++ ")"
+                       then "(" ++ code ++ "_bwd " ++ v ++ ")"
                        else "(" ++ code ++ " " ++ v ++ ")"
 
                 results = zipWith compileArg es vars
@@ -300,20 +284,30 @@ compileBackward ctx expr = case expr of
                     let code1 = compileBackward ctx e1
                         code2 = compileForward ctx e2
                     in if needsProjection ctx e1 then
-                        "((snd " ++ code1 ++ ") " ++ code2 ++ ")"
+                        "(" ++ code1 ++ "_bwd " ++ code2 ++ ")"
                     else
                         "(" ++ code1 ++ " " ++ code2 ++ ")"
                 else
                     compileForward ctx expr
 
+    -- Case expressions
+    Core.Case e alts ->
+        let scrutinee = compileBackward ctx e
+            compileAlt (p, body) =
+                let pVars   = patVars p
+                    bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
+                in "  " ++ compilePattern p ++ " -> " ++ compileBackward bodyCtx body
+            altsCode = map compileAlt alts
+        in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
+
     -- Reversible Case expressions (Backwards)
     Core.RCase e rAlts ->
         let scrutBwd = compileBackward ctx e
             scrutFwd = let code = compileForward ctx e
-                       in if needsProjection ctx e then "(fst " ++ code ++ ")" else code
+                       in if needsProjection ctx e then code ++ "_fwd" else code
 
             scrutCall bwdVal = if needsProjection ctx e
-                               then "((snd " ++ scrutBwd ++ ") " ++ bwdVal ++ ")"
+                               then "(" ++ scrutBwd ++ "_bwd " ++ bwdVal ++ ")"
                                else "(" ++ scrutBwd ++ " " ++ bwdVal ++ ")"
 
             buildIfChain [] = "error \"No matching pin found during inversion in rcase\""
