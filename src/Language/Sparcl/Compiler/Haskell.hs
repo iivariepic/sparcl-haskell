@@ -14,10 +14,14 @@ data BindingKind
     | LinearReversible   -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
     deriving (Eq, Show)
 
+-- Data type that tells us if we are inside a reversible binding
+data ContextMode = Inside | Outside deriving (Eq, Show)
+
 -- Data type for the context of the compiler
 data CompilerContext =  CompilerContext
     { ctxTypeMap  :: [(Name.Name, PolyTy)]
     , ctxEnv :: [(Name.Name, BindingKind)]
+    , ctxMode :: ContextMode
     }
 
 -- Helper to extract all bound variables from a pattern
@@ -43,10 +47,10 @@ translateConName name
 -- Helper to determine if an expression is a reversible pair that needs projection
 needsProjection :: CompilerContext -> Core.Exp Name.Name -> Bool
 needsProjection ctx (Core.Var n) =
-    case lookup n (ctxEnv ctx) of
+    (ctxMode ctx /= Outside) && (case lookup n (ctxEnv ctx) of
         Just LinearReversible -> True
         Just PureCopyable -> False
-        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx))
+        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx)))
 needsProjection _ (Core.App _ _) = False
 needsProjection _ _ = False
 
@@ -56,27 +60,34 @@ compileLiteral l = case l of
     Literal.LitInt i    -> show i
     _                   -> error "compileLiteral: Unhandled literal type"
 
--- Helper function to check if binding is reversible
+-- Helper function to check if binding is reversible structurally
 isReversible :: Ty -> Bool
 isReversible ty = case ty of
     (_ :-@ _) -> True
-    TyCon c _ | prettyShow c == "rev" -> True
+    TyCon c _ | prettyShow c `elem` ["rev", "NRev", "(rev)"] -> True
     TyForAll _ (TyQual _ innerTy) -> isReversible innerTy
     TySyn _ innerTy -> isReversible innerTy
-    -- Catch types that return reversible functions (e.g., Bit -> rev L -o L)
-    _ -> "-o" `isInfixOf` prettyShow ty || "rev" `isInfixOf` prettyShow ty
+    _ -> isReversibleSpine ty
+
+isReversibleSpine :: Ty -> Bool
+isReversibleSpine ty = case ty of
+    _ :-@ _ -> True
+    TyCon _ [TyMult _, _, ret] -> isReversibleSpine ret
+    TyCon c _ | prettyShow c `elem` ["rev", "NRev", "(rev)"] -> True
+    TyForAll _ (TyQual _ innerTy) -> isReversibleSpine innerTy
+    TySyn _ innerTy               -> isReversibleSpine innerTy
+    _ -> False
 
 -- Helper to check if an application chain belongs to a reversible function
 isReversibleAppChain :: CompilerContext -> Core.Exp Name.Name -> Bool
 isReversibleAppChain ctx (Core.Var n) =
-    case lookup n (ctxEnv ctx) of
+    (ctxMode ctx /= Outside) && (case lookup n (ctxEnv ctx) of
         Just LinearReversible -> True
         Just PureCopyable -> False
-        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx))
+        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx)))
 isReversibleAppChain ctx (Core.App e1 _) = isReversibleAppChain ctx e1
 isReversibleAppChain ctx (Core.RPin e1 _) = isReversibleAppChain ctx e1
 isReversibleAppChain _ _ = False
-
 -- Top-level Bindings
 compileBinding :: CompilerContext -> (Name.Name, Ty, Core.Exp Name.Name) -> String
 compileBinding ctx (name, ty, expr) =
@@ -84,14 +95,15 @@ compileBinding ctx (name, ty, expr) =
       nameStr = formatName rawName
 
       bKind = if isReversible ty then LinearReversible else PureCopyable
-      initBodyCtx = ctx { ctxEnv = (name, bKind) : ctxEnv ctx }
+      bMode = if isReversible ty then Inside else Outside
+      initBodyCtx = ctx { ctxEnv = (name, bKind) : ctxEnv ctx, ctxMode = bMode }
 
   in if bKind == LinearReversible
     then
         let fwdCode = compileForward initBodyCtx expr
             bwdCode = compileBackward initBodyCtx expr
         in nameStr ++ " = (" ++ nameStr ++ "_fwd , " ++ nameStr ++ "_bwd)\n"
-        ++ nameStr ++ "_fwd = (" ++ fwdCode ++ ")\n" ++ nameStr ++ "_bwd = (" ++ bwdCode ++ ")"
+        ++ nameStr ++ "_fwd = " ++ fwdCode ++ "\n" ++ nameStr ++ "_bwd = " ++ bwdCode
     else
         let code = compileForward initBodyCtx expr
         in nameStr ++ " = " ++ code
@@ -387,6 +399,7 @@ generateHaskellModule modName typeMap ddecls bindings =
         initCtx = CompilerContext
                     { ctxTypeMap  = typeMap
                     , ctxEnv = []
+                    , ctxMode = Outside
                     }
         generatedDecls = map (compileBinding initCtx) bindings
         compiledDDecls = map compileDDecl ddecls
