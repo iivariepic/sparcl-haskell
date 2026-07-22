@@ -118,15 +118,13 @@ compileForward ctx expr = case expr of
     Core.Con c es -> compileConstructor c es
     Core.RCon c es ->
             let cName = translateConName (prettyShow c)
-                -- For each subexpression, check if it requires a tuple projection
                 compileArg e =
                     let code = compileForward ctx e
                     in if needsProjection ctx e
-                       then "((fst " ++ code ++ ") _s)"
-                       else "(" ++ code ++ " _s)"
+                       then "(fst " ++ code ++ ")"
+                       else code
                 args = map compileArg es
-                body = if null args then cName else "(" ++ cName ++ " " ++ unwords args ++ ")"
-            in "(\\_s -> " ++ body ++ ")"
+            in if null args then cName else "(" ++ cName ++ " " ++ unwords args ++ ")"
 
     -- Let bindings
     Core.Let binds body ->
@@ -147,25 +145,24 @@ compileForward ctx expr = case expr of
     -- Reversible Case expressions
     Core.RCase e rAlts ->
         let scrutCode = compileForward ctx e
-            -- Thread the forward state into the scrutinee
             scrutVal  = if needsProjection ctx e
-                        then "((fst " ++ scrutCode ++ ") _s)"
-                        else "(" ++ scrutCode ++ " _s)"
+                        then "(fst " ++ scrutCode ++ ")"
+                        else scrutCode
 
             compileAlt (p, body, _pin) =
                 let pVars   = patVars p
                     bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                -- Evaluate the branch body forward with the same state state
-                in "  " ++ compilePattern p ++ " -> (" ++ compileForward bodyCtx body ++ ") _s"
+                -- Evaluate the branch body forward under the current environment bindings
+                in "  " ++ compilePattern p ++ " -> " ++ compileForward bodyCtx body
 
             altsCode = map compileAlt rAlts
-        in "(\\_s -> case " ++ scrutVal ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
+        in "(case " ++ scrutVal ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
 
     -- RPin
     Core.RPin e1 e2 ->
         let f1Code = compileForward ctx e1
             hCode  = compileForward ctx e2
-        in "(\\_s -> let _a = (" ++ f1Code ++ ") _s; _f2 = (" ++ hCode ++ ") _a in (_a, _f2 _s))"
+        in "(let _a = " ++ f1Code ++ " in let _f2 = fst (" ++ hCode ++ " _a) in (_a, _f2))"
 
     -- Lift
     Core.Lift e1 e2 ->
