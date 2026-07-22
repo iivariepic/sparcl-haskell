@@ -377,6 +377,10 @@ capitalize :: String -> String
 capitalize "" = ""
 capitalize (x:xs) = toUpper x : xs
 
+-- Helper function to construct the main IO function that logs all bindings
+constructPutStrLn :: (Name.Name, Ty, Core.Exp Name.Name) -> String
+constructPutStrLn (name, _, _) = "\"\\n" ++ prettyShow name ++ ": \" ++ show " ++ formatName (prettyShow name)
+
 generateHaskellModule :: String -> [(Name.Name, PolyTy)] -> [Core.DDecl Name.Name] -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
 generateHaskellModule modName typeMap ddecls bindings =
     let
@@ -393,7 +397,7 @@ generateHaskellModule modName typeMap ddecls bindings =
               ] ++ compiledDDecls ++
               [ ""
               , "main :: IO ()"
-              , "main = putStrLn \"This is placeholder code! I will replace this later!\""
+              , "main = putStrLn (" ++ intercalate " ++ " (map constructPutStrLn bindings) ++ ")"
               , ""
               ] ++ generatedDecls
     in (haskellCode, ".hs")
