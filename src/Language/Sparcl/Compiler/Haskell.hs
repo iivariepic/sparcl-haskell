@@ -32,6 +32,14 @@ formatName s
     | not (null s) && all (`elem` "!#$%&*+./<=>?@\\^|-~:") s = "(" ++ s ++ ")"
     | otherwise = s
 
+-- Helper function to translate internal constructor names
+translateConName :: String -> String
+translateConName name
+    | Just rest <- stripPrefix "<Tup " name =
+        let n = read (init rest) :: Int
+        in "(" ++ replicate (n - 1) ',' ++ ")"
+    | otherwise = name
+
 -- Helper to determine if an expression is a reversible pair that needs projection
 needsProjection :: CompilerContext -> Core.Exp Name.Name -> Bool
 needsProjection ctx (Core.Var n) =
@@ -98,16 +106,6 @@ compilePattern pat = case pat of
         in  if null psCode
             then cName
             else "(" ++ cName ++ " " ++ unwords psCode ++ ")"
-
--- Helper function to translate internal constructor names
-translateConName :: String -> String
-translateConName name
-
-    | Just rest <- stripPrefix "<Tup " name =
-        let n = read (init rest) :: Int
-        in "(" ++ replicate (n - 1) ',' ++ ")"
-
-    | otherwise = name
 
 -- Compiling unidirectional or forward functions
 compileForward :: CompilerContext -> Core.Exp Name.Name -> String
@@ -229,7 +227,7 @@ compileBackward ctx expr = case expr of
     -- Data constructors
     Core.RCon c es ->
             let cName = translateConName (prettyShow c)
-                vars  = [ "_v" ++ show i | i <- [1..length es] ]
+                vars  = [ "_v" ++ prettyShow i | i <- [1..length es] ]
                 pat   = if null vars then cName else "(" ++ cName ++ " " ++ unwords vars ++ ")"
 
                 compileArg e v =
