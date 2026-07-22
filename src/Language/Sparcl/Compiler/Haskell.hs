@@ -241,7 +241,7 @@ compileBackward ctx expr = case expr of
     -- Data constructors
     Core.RCon c es ->
             let cName = translateConName (prettyShow c)
-                vars  = [ "_v" ++ prettyShow i | i <- [1..length es] ]
+                vars  = [ "_v" ++ show i | i <- [1..length es] ]
                 pat   = if null vars then cName else "(" ++ cName ++ " " ++ unwords vars ++ ")"
 
                 compileArg e v =
@@ -255,7 +255,7 @@ compileBackward ctx expr = case expr of
                     []  -> "()"
                     [r] -> r
                     _   -> "(" ++ intercalate ", " results ++ ")"
-            in "(\\" ++ pat ++ " -> " ++ body ++ ")"
+            in "(\\_v -> case _v of { " ++ pat ++ " -> " ++ body ++ "; _ -> error \"Backward RCon mismatch: expected " ++ cName ++ "\" })"
 
     -- Let bindings
     Core.Let binds body ->
@@ -282,7 +282,7 @@ compileBackward ctx expr = case expr of
         in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
 
     -- Unlift
-    Core.Unlift e -> compileForward ctx e
+    Core.Unlift _ -> "(\\_v -> _v)"
 
     -- Recursive compilation of the entire function App
     Core.App e1 e2 ->
@@ -300,7 +300,7 @@ compileBackward ctx expr = case expr of
                     else
                         "(" ++ code1 ++ " " ++ code2 ++ ")"
                 else
-                    compileForward ctx expr
+                    "(\\_v -> _v)"
 
     -- Case expressions
     Core.Case e alts ->
@@ -332,13 +332,13 @@ compileBackward ctx expr = case expr of
                     upPat     = buildTuplePat body
 
                     branchVal = "(case " ++ scrutFwd ++ " of { " ++ compilePattern p ++ " -> " ++
-                                "let " ++ upPat ++ " = (" ++ bodyBwd ++ ") _v in " ++
+                                "let !" ++ upPat ++ " = (" ++ bodyBwd ++ ") _v in " ++
                                 compilePattern p ++ "; _ -> error \"unreachable rcase pattern\" })"
 
                 in "if (" ++ pinCode ++ ") _v then " ++ scrutCall branchVal ++ " else " ++ buildIfChain rest
         in "(\\_v -> " ++ buildIfChain rAlts ++ ")"
 
-    _ -> compileForward ctx expr
+    _ -> "(\\_v -> _v)"
 
 -- Helper to build a tuple pattern mapping the backward output of an expression
 buildTuplePat :: Core.Exp Name.Name -> String
@@ -350,10 +350,12 @@ buildTuplePat expr = case expr of
             []  -> "()"
             [p] -> p
             _   -> "(" ++ intercalate ", " pats ++ ")"
-    Core.App _ e2 -> buildTuplePat e2     -- App backward returns the updated argument (e2)
+    Core.App _ e2 -> buildTuplePat e2
     Core.RPin e1 _ -> buildTuplePat e1
     Core.Lift _ e2 -> buildTuplePat e2
     Core.Let _ body -> buildTuplePat body
+    Core.RCase scrutinee _ -> buildTuplePat scrutinee
+    Core.Case scrutinee _ -> buildTuplePat scrutinee
     _ -> "_"
 
 -- Function to compile data declarations
@@ -391,6 +393,13 @@ capitalize :: String -> String
 capitalize "" = ""
 capitalize (x:xs) = toUpper x : xs
 
+isFunctionTy :: Ty -> Bool
+isFunctionTy ty = case ty of
+    _ :-@ _ -> True
+    TyForAll _ (TyQual _ innerTy) -> isFunctionTy innerTy
+    TySyn _ innerTy -> isFunctionTy innerTy
+    _ -> False
+
 -- Helper function to construct the main IO function that logs all bindings
 constructPutStrLn :: (Name.Name, Ty, Core.Exp Name.Name) -> String
 constructPutStrLn (name, _, _) = "\"\\n" ++ prettyShow name ++ ": \" ++ show " ++ formatName (prettyShow name)
@@ -405,14 +414,16 @@ generateHaskellModule modName typeMap ddecls bindings =
                     }
         generatedDecls = map (compileBinding initCtx) bindings
         compiledDDecls = map compileDDecl ddecls
+        showableBindings = filter (\(_, ty, _) -> not (isFunctionTy ty)) bindings
         haskellCode = unlines $
-              [ "module " ++ capitalize modName ++ " where"
+              ["{-# LANGUAGE BangPatterns #-}"
+              ,"module " ++ capitalize modName ++ " where"
               , ""
               , "import Prelude hiding (fst, snd, (.))"
               ] ++ compiledDDecls ++
               [ ""
               , "main :: IO ()"
-              , "main = putStrLn (" ++ intercalate " ++ " (map constructPutStrLn bindings) ++ ")"
+              , "main = putStrLn (" ++ intercalate " ++ " (map constructPutStrLn showableBindings) ++ ")"
               , ""
               , intercalate "\n\n" generatedDecls]
     in (haskellCode, ".hs")
