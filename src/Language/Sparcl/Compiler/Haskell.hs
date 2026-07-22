@@ -102,8 +102,8 @@ compileBinding ctx (name, ty, expr) =
     then
         let fwdCode = compileForward initBodyCtx expr
             bwdCode = compileBackward initBodyCtx expr
-        in nameStr ++ " = (" ++ nameStr ++ "_fwd , " ++ nameStr ++ "_bwd)\n"
-        ++ nameStr ++ "_fwd = " ++ fwdCode ++ "\n" ++ nameStr ++ "_bwd = " ++ bwdCode
+        in nameStr ++ " = (" ++ nameStr ++ "_fwd , " ++ nameStr ++ "_bwd)\n\n"
+        ++ nameStr ++ "_fwd = " ++ fwdCode ++ "\n\n" ++ nameStr ++ "_bwd = " ++ bwdCode
     else
         let code = compileForward initBodyCtx expr
         in nameStr ++ " = " ++ code
@@ -412,5 +412,5 @@ generateHaskellModule modName typeMap ddecls bindings =
               , "main :: IO ()"
               , "main = putStrLn (" ++ intercalate " ++ " (map constructPutStrLn bindings) ++ ")"
               , ""
-              ] ++ generatedDecls
+              , intercalate "\n\n" generatedDecls]
     in (haskellCode, ".hs")
