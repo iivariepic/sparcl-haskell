@@ -30,15 +30,17 @@ patVars pat = case pat of
     Core.PVar n      -> [n]
     Core.PCon _ args -> concatMap patVars args
 
--- Helper function to wrap symboling operators in parentheses
+-- Helper function to format names to valid Haskell
 formatName :: String -> String
 formatName s
+    | "Base." `isPrefixOf` s = formatName (drop 5 s)
     | not (null s) && all (`elem` "!#$%&*+./<=>?@\\^|-~:") s = "(" ++ s ++ ")"
     | otherwise = s
 
 -- Helper function to translate internal constructor names
 translateConName :: String -> String
 translateConName name
+    | "Base." `isPrefixOf` name = translateConName (drop 5 name)
     | Just rest <- stripPrefix "<Tup " name =
         let n = read (init rest) :: Int
         in "(" ++ replicate (n - 1) ',' ++ ")"
@@ -88,6 +90,7 @@ isReversibleAppChain ctx (Core.Var n) =
 isReversibleAppChain ctx (Core.App e1 _) = isReversibleAppChain ctx e1
 isReversibleAppChain ctx (Core.RPin e1 _) = isReversibleAppChain ctx e1
 isReversibleAppChain _ _ = False
+
 -- Top-level Bindings
 compileBinding :: CompilerContext -> (Name.Name, Ty, Core.Exp Name.Name) -> String
 compileBinding ctx (name, ty, expr) =
@@ -186,7 +189,6 @@ compileForward ctx expr = case expr of
             compileAlt (p, body, _pin) =
                 let pVars   = patVars p
                     bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                -- Evaluate the branch body forward under the current environment bindings
                 in "  " ++ compilePattern p ++ " -> " ++ compileForward bodyCtx body
 
             altsCode = map compileAlt rAlts
@@ -196,7 +198,7 @@ compileForward ctx expr = case expr of
     Core.RPin e1 e2 ->
         let f1Code = compileForward ctx e1
             hCode  = compileForward ctx e2
-        in "(let _a = " ++ f1Code ++ " in let _f2 = fst (" ++ hCode ++ " _a) in (_a, _f2))"
+        in "(let _a = " ++ f1Code ++ " in let _f2 = (" ++ hCode ++ " _a) in (_a, _f2))"
 
     -- Lift
     Core.Lift e1 e2 ->
@@ -302,7 +304,7 @@ compileBackward ctx expr = case expr of
 
     -- Case expressions
     Core.Case e alts ->
-        let scrutinee = compileBackward ctx e
+        let scrutinee = compileForward ctx e
             compileAlt (p, body) =
                 let pVars   = patVars p
                     bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
