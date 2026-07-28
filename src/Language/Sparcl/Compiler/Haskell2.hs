@@ -288,6 +288,33 @@ compileExpr ctx expr = case expr of
                 then HTuple compiledArgs
                 else foldl HApp (HCon (translateConName rawCName)) compiledArgs
 
+    -- Reversible Constructor Applications
+    Core.RCon c es ->
+        let compiledArgs = map (compileExpr ctx) es
+
+            -- 1. Extract forward and backward expressions for all arguments
+            fwdArgs = map getFwd compiledArgs
+            bwdArgs = map getBwd compiledArgs
+
+            -- 2. Bubble up all reconstructions from the arguments
+            recs = concatMap (\res -> case backward res of
+                                        Just b  -> bwdRecs b
+                                        Nothing -> []) compiledArgs
+
+            rawCName = prettyShow c
+            cName    = translateConName rawCName
+
+            -- 3. Helper to build the constructor application safely (handling Tuples vs standard Constructors)
+            buildNode args = if isTupleName rawCName
+                             then HTuple args
+                             else foldl HApp (HCon cName) args
+
+            -- 4. Apply the exact same structural construction to both passes
+            fwdNode = buildNode fwdArgs
+            bwdNode = buildNode bwdArgs
+
+        in reversible fwdNode bwdNode recs
+
     Core.Case e alts ->
         let compiledScrut = getFwd (compileExpr ctx e)
             compileAlt (pat, body) =
