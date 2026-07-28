@@ -126,27 +126,30 @@ data BindingKind
     | Linear     -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
     deriving (Eq, Show)
 
+-- | Represents the reconstruction of a value in the backward pass
+type Reconstruction = (HsPat, HsExpr)
+
 -- | The Backward Pass structure
 data BwdResult = BwdResult
     { bwdExpr :: HsExpr
-    , bwdEnv  :: [Variable]
-    }
+    , bwdRecs :: [Reconstruction]
+    } deriving (Eq, Show)
 
 -- | The Compile Result Representation
 data CompileResult = CompileResult
     { forward  :: HsExpr
     , backward :: Maybe BwdResult
-    }
+    } deriving (Eq, Show)
 
 -- | Smart constructor for forward-only computations
 fwdOnly :: HsExpr -> CompileResult
 fwdOnly e = CompileResult { forward = e, backward = Nothing }
 
 -- | Smart constructor for reversible computations
-reversible :: HsExpr -> HsExpr -> [Variable] -> CompileResult
+reversible :: HsExpr -> HsExpr -> [Reconstruction] -> CompileResult
 reversible fwd bwd recs = CompileResult
     { forward  = fwd
-    , backward = Just (BwdResult { bwdExpr = bwd, bwdEnv = recs })
+    , backward = Just (BwdResult { bwdExpr = bwd, bwdRecs = recs })
     }
 
 -- | Helper to grab just the forward expression
