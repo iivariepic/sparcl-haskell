@@ -5,6 +5,7 @@ import qualified Language.Sparcl.Name as Name
 import qualified Language.Sparcl.Literal as Literal
 import           Language.Sparcl.Pretty (prettyShow)
 import           Data.List
+import           Data.Maybe
 import           Data.Char (toUpper)
 import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@), PolyTy)
 
@@ -12,6 +13,7 @@ import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@),
 data BindingKind
     = PureCopyable       -- ^ Belongs to \Gamma (can be duplicated/dropped freely)
     | LinearReversible   -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
+    | Continuation       -- ^ Bound directly to a backward continuation (no tuple projection needed)
     deriving (Eq, Show)
 
 -- Data type that tells us if we are inside a reversible binding
@@ -46,15 +48,31 @@ translateConName name
         in "(" ++ replicate (n - 1) ',' ++ ")"
     | otherwise = name
 
--- Helper to determine if an expression is a reversible pair that needs projection
 needsProjection :: CompilerContext -> Core.Exp Name.Name -> Bool
 needsProjection ctx (Core.Var n) =
-    (ctxMode ctx /= Outside) && (case lookup n (ctxEnv ctx) of
+    ctxMode ctx /= Outside && (case lookup n (ctxEnv ctx) of
         Just LinearReversible -> True
+        Just Continuation -> False
         Just PureCopyable -> False
         Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx)))
 needsProjection _ (Core.App _ _) = False
 needsProjection _ _ = False
+
+-- Helper to project the forward part of a reversible pair
+projectFwd :: CompilerContext -> Core.Exp Name.Name -> String -> String
+projectFwd ctx (Core.Var n) code =
+    case lookup n (ctxEnv ctx) of
+        Just LinearReversible -> "(let (_f, _) = " ++ code ++ " in _f)"
+        _ -> code ++ "_fwd"
+projectFwd _ _ code = code
+
+-- Helper to project the backward part of a reversible pair
+projectBwd :: CompilerContext -> Core.Exp Name.Name -> String -> String
+projectBwd ctx (Core.Var n) code =
+    case lookup n (ctxEnv ctx) of
+        Just LinearReversible -> "(let (_, _b) = " ++ code ++ " in _b)"
+        _ -> code ++ "_bwd"
+projectBwd _ _ code = code
 
 -- Literals
 compileLiteral :: Literal.Literal -> String
@@ -74,7 +92,7 @@ isReversible ty = case ty of
 isReversibleSpine :: Ty -> Bool
 isReversibleSpine ty = case ty of
     _ :-@ _ -> True
-    TyCon _ [TyMult _, _, ret] -> isReversibleSpine ret
+    TyCon tc [_, _, ret] | "NArrow" `isInfixOf` show tc -> isReversibleSpine ret
     TyCon c _ | prettyShow c `elem` ["rev", "NRev", "(rev)"] -> True
     TyForAll _ (TyQual _ innerTy) -> isReversibleSpine innerTy
     TySyn _ innerTy               -> isReversibleSpine innerTy
@@ -83,13 +101,25 @@ isReversibleSpine ty = case ty of
 -- Helper to check if an application chain belongs to a reversible function
 isReversibleAppChain :: CompilerContext -> Core.Exp Name.Name -> Bool
 isReversibleAppChain ctx (Core.Var n) =
-    (ctxMode ctx /= Outside) && (case lookup n (ctxEnv ctx) of
+    ctxMode ctx /= Outside && (case lookup n (ctxEnv ctx) of
         Just LinearReversible -> True
-        Just PureCopyable -> False
-        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx)))
+        Just Continuation -> True
+        _ -> maybe False isReversible (lookup n (ctxTypeMap ctx)))
 isReversibleAppChain ctx (Core.App e1 _) = isReversibleAppChain ctx e1
 isReversibleAppChain ctx (Core.RPin e1 _) = isReversibleAppChain ctx e1
 isReversibleAppChain _ _ = False
+
+-- Helper to check if an expression is a reversible term (regardless of context mode)
+isReversibleExpr :: CompilerContext -> Core.Exp Name.Name -> Bool
+isReversibleExpr ctx (Core.Var n) = case lookup n (ctxEnv ctx) of
+    Just LinearReversible -> True
+    Just Continuation -> True
+    Just PureCopyable -> False
+    Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx))
+isReversibleExpr ctx (Core.App e1 _) = isReversibleExpr ctx e1
+isReversibleExpr ctx (Core.RPin e1 _) = isReversibleExpr ctx e1
+isReversibleExpr ctx (Core.Abs _ e) = isReversibleExpr ctx e
+isReversibleExpr _ _ = False
 
 -- Top-level Bindings
 compileBinding :: CompilerContext -> (Name.Name, Ty, Core.Exp Name.Name) -> String
@@ -134,9 +164,17 @@ compileForward ctx expr = case expr of
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCtx  = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx }
-            bodyCode = compileForward bodyCtx e
-        in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
+            isRevLambda = ctxMode ctx == Outside && isReversibleExpr ctx e
+        in if isRevLambda
+           then
+               let bodyContext = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx, ctxMode = Inside }
+                   fwdCode = compileForward bodyContext e
+                   bwdCode = compileBackward bodyContext e
+               in "( (\\" ++ varName ++ " -> " ++ fwdCode ++ ") , (\\_v -> let " ++ varName ++ " = undefined in (" ++ bwdCode ++ ") _v) )"
+           else
+               let bodyCtx  = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx }
+                   bodyCode = compileForward bodyCtx e
+               in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors
     Core.Con c es ->
@@ -151,7 +189,7 @@ compileForward ctx expr = case expr of
             compileArg e =
                 let code = compileForward ctx e
                 in if needsProjection ctx e
-                   then code ++ "_fwd"
+                   then projectFwd ctx e code
                    else code
             args = map compileArg es
         in if null args then cName else "(" ++ cName ++ " " ++ unwords args ++ ")"
@@ -183,9 +221,8 @@ compileForward ctx expr = case expr of
     Core.RCase e rAlts ->
         let scrutCode = compileForward ctx e
             scrutVal  = if needsProjection ctx e
-                        then scrutCode ++ "_fwd"
+                        then projectFwd ctx e scrutCode
                         else scrutCode
-
             compileAlt (p, body, _pin) =
                 let pVars   = patVars p
                     bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
@@ -214,7 +251,7 @@ compileForward ctx expr = case expr of
         let code1 = compileForward ctx e1
             code2 = compileForward ctx e2
         in if needsProjection ctx e1
-            then "(" ++ code1 ++ "_fwd " ++ code2 ++ ")"
+            then "(" ++ projectFwd ctx e1 code1 ++ " " ++ code2 ++ ")"
             else "(" ++ code1 ++ " " ++ code2 ++ ")"
 
 -- Compiling backward functions
@@ -226,6 +263,7 @@ compileBackward ctx expr = case expr of
         case lookup n (ctxEnv ctx) of
             Just PureCopyable -> "(\\_v -> _v)"
             Just LinearReversible -> formatName (prettyShow n)
+            Just Continuation -> formatName (prettyShow n)
             Nothing ->
                 if needsProjection ctx expr then
                     formatName (prettyShow n)
@@ -235,7 +273,8 @@ compileBackward ctx expr = case expr of
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCtx  = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx }
+            bKind    = Data.Maybe.fromMaybe PureCopyable (lookup n (ctxEnv ctx))
+            bodyCtx  = ctx { ctxEnv = (n, bKind) : ctxEnv ctx }
             bodyCode = compileBackward bodyCtx e
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
@@ -248,7 +287,7 @@ compileBackward ctx expr = case expr of
                 compileArg e v =
                     let code = compileBackward ctx e
                     in if needsProjection ctx e
-                       then "(" ++ code ++ "_bwd " ++ v ++ ")"
+                       then "(" ++ projectBwd ctx e code ++ " " ++ v ++ ")"
                        else "(" ++ code ++ " " ++ v ++ ")"
 
                 results = zipWith compileArg es vars
@@ -288,16 +327,20 @@ compileBackward ctx expr = case expr of
     -- Recursive compilation of the entire function App
     Core.App e1 e2 ->
         case e1 of
-            Core.Abs _ _ ->
-                let code1 = compileBackward ctx e1
-                    code2 = compileForward ctx e2
+            Core.Abs n _ ->
+                let rev2   = isReversibleExpr ctx e2
+                    bKind  = if rev2 then Continuation else PureCopyable
+                    absCtx = ctx { ctxEnv = (n, bKind) : ctxEnv ctx }
+                    code1  = compileBackward absCtx e1
+                    code2  = if rev2 then compileBackward ctx e2 else compileForward ctx e2
                 in "(" ++ code1 ++ " " ++ code2 ++ ")"
             _ ->
                 if isReversibleAppChain ctx e1 then
                     let code1 = compileBackward ctx e1
-                        code2 = compileForward ctx e2
+                        rev2  = isReversibleExpr ctx e2
+                        code2 = if rev2 then compileBackward ctx e2 else compileForward ctx e2
                     in if needsProjection ctx e1 then
-                        "(" ++ code1 ++ "_bwd " ++ code2 ++ ")"
+                "(" ++ projectBwd ctx e1 code1 ++ " " ++ code2 ++ ")"
                     else
                         "(" ++ code1 ++ " " ++ code2 ++ ")"
                 else
@@ -316,11 +359,9 @@ compileBackward ctx expr = case expr of
     -- Reversible Case expressions (Backwards)
     Core.RCase e rAlts ->
         let scrutBwd = compileBackward ctx e
-            scrutFwd = let code = compileForward ctx e
-                       in if needsProjection ctx e then code ++ "_fwd" else code
 
             scrutCall bwdVal = if needsProjection ctx e
-                               then "(" ++ scrutBwd ++ "_bwd " ++ bwdVal ++ ")"
+                               then "(" ++ projectBwd ctx e scrutBwd ++ " " ++ bwdVal ++ ")"
                                else "(" ++ scrutBwd ++ " " ++ bwdVal ++ ")"
 
             buildIfChain [] = "error \"No matching pin found during inversion in rcase\""
@@ -330,34 +371,51 @@ compileBackward ctx expr = case expr of
                     bodyCtx   = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
                     bodyBwd   = compileBackward bodyCtx body
 
-                    upPat     = buildTuplePat body
+                    -- Helper to find which variables are actually used in an expression
+                    varsIn :: Core.Exp Name.Name -> [Name.Name]
+                    varsIn (Core.Var n) = [n]
+                    varsIn (Core.Lit _) = []
+                    varsIn (Core.RCon _ es) = concatMap varsIn es
+                    varsIn (Core.Con _ es) = concatMap varsIn es
+                    varsIn (Core.Let binds letBody) = concatMap (\(_,_,be) -> varsIn be) binds ++ varsIn letBody
+                    varsIn (Core.Case ce alts) = varsIn ce ++ concatMap (\(_,be) -> varsIn be) alts
+                    varsIn (Core.RCase ce ralts) = varsIn ce ++ concatMap (\(_,be,_) -> varsIn be) ralts
+                    varsIn (Core.App e1 e2) = varsIn e1 ++ varsIn e2
+                    varsIn (Core.Abs an ae) = filter (/= an) (varsIn ae)
+                    varsIn (Core.RPin e1 e2) = varsIn e1 ++ varsIn e2
+                    varsIn (Core.Lift e1 e2) = varsIn e1 ++ varsIn e2
+                    varsIn (Core.Unlift ue) = varsIn ue
 
-                    branchVal = "(case " ++ scrutFwd ++ " of { " ++ compilePattern p ++ " -> " ++
-                                "let !" ++ upPat ++ " = (" ++ bodyBwd ++ ") _v in " ++
-                                compilePattern p ++ "; _ -> error \"unreachable rcase pattern\" })"
+                    -- Helper to deduce the exact tuple pattern matching bodyBwd's shape
+                    buildTuplePat :: Core.Exp Name.Name -> [Name.Name] -> String
+                    buildTuplePat expr allowed =
+                        let exprVarsUnordered = varsIn expr
+                            exprVars = filter (`elem` exprVarsUnordered) allowed
+                        in case expr of
+                            Core.Var n -> if n `elem` allowed then formatName (prettyShow n) else "_"
+                            Core.RCon _ es ->
+                                let pats = map (`buildTuplePat` allowed) es
+                                in case pats of
+                                    []  -> "()"
+                                    [pat] -> pat
+                                    _   -> "(" ++ intercalate ", " pats ++ ")"
+                            Core.Let _ bodyExp -> buildTuplePat bodyExp allowed
+                            Core.Case _ alts -> if null alts then "_" else buildTuplePat (snd $ head alts) allowed
+                            Core.RCase _ ralts -> if null ralts then "_" else buildTuplePat (let (_, b, _) = head ralts in b) allowed
+                            Core.Lit _ -> "()"
+                            _ -> case exprVars of
+                                    []  -> "_"
+                                    [v] -> formatName (prettyShow v)
+                                    vs  -> "(" ++ intercalate ", " (map (formatName . prettyShow) vs) ++ ")"
+
+                    upPat     = buildTuplePat body pVars
+                    branchVal = "(let !" ++ upPat ++ " = (" ++ bodyBwd ++ ") _v in " ++ compilePattern p ++ ")"
 
                 in "if (" ++ pinCode ++ ") _v then " ++ scrutCall branchVal ++ " else " ++ buildIfChain rest
         in "(\\_v -> " ++ buildIfChain rAlts ++ ")"
 
     _ -> "(\\_v -> _v)"
 
--- Helper to build a tuple pattern mapping the backward output of an expression
-buildTuplePat :: Core.Exp Name.Name -> String
-buildTuplePat expr = case expr of
-    Core.Var n -> formatName (prettyShow n)
-    Core.RCon _ es ->
-        let pats = map buildTuplePat es
-        in case pats of
-            []  -> "()"
-            [p] -> p
-            _   -> "(" ++ intercalate ", " pats ++ ")"
-    Core.App _ e2 -> buildTuplePat e2
-    Core.RPin e1 _ -> buildTuplePat e1
-    Core.Lift _ e2 -> buildTuplePat e2
-    Core.Let _ body -> buildTuplePat body
-    Core.RCase scrutinee _ -> buildTuplePat scrutinee
-    Core.Case scrutinee _ -> buildTuplePat scrutinee
-    _ -> "_"
 
 -- Function to compile data declarations
 compileDDecl :: Core.DDecl Name.Name -> String

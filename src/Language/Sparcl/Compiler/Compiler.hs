@@ -1,7 +1,7 @@
 module Language.Sparcl.Compiler.Compiler where
 
 import qualified Language.Sparcl.Surface.Parsing   as Parser
-import qualified Language.Sparcl.Compiler.Haskell  as HsCompiler
+import qualified Language.Sparcl.Compiler.Haskell2 as HsCompiler
 import qualified Language.Sparcl.Core.Syntax       as Core
 import qualified Language.Sparcl.Surface.Syntax    as S
 import qualified Control.Monad.Reader              as Rd
