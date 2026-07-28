@@ -279,7 +279,15 @@ compileExpr ctx expr = case expr of
         fwdOnly (getFwd (compileExpr ctx e))
 
     Core.Var n ->
-        fwdOnly (HVar (formatName (prettyShow n)))
+        let v = formatName (prettyShow n)
+        in case lookupVar n (ctxEnv ctx) of
+            Just Linear ->
+                reversible
+                    (HVar v)
+                    (Reconstruction (HPVar v) (HVar v))
+                    []
+            _ ->
+                fwdOnly (HVar v)
 
     Core.Abs n body ->
         let varObj  = Variable n Copy
