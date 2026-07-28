@@ -127,14 +127,45 @@ data BindingKind
     deriving (Eq, Show)
 
 -- | Represents the reconstruction of a value in the backward pass
-type Reconstruction = (HsPat, HsExpr)
-
--- | The Backward Pass structure
-data BwdResult = BwdResult
-    { bwdExpr     :: HsExpr
-    , bwdPattern  :: HsPat
-    , bwdBindings :: [Reconstruction]
+data Reconstruction = Reconstruction
+    { reconPat  :: HsPat
+    , reconExpr :: HsExpr
     } deriving (Eq, Show)
+
+-- | The Backward Pass structure natively tracking its own root pattern and child bindings
+data BwdResult = BwdResult
+    { bwdRoot     :: Reconstruction
+    , bwdRecons :: [Reconstruction]
+    } deriving (Eq, Show)
+
+-- | Smart constructor for reversible computations
+reversible :: HsExpr -> Reconstruction -> [Reconstruction] -> CompileResult
+reversible fwd root children = CompileResult
+    { forward  = fwd
+    , backward = Just (BwdResult root children)
+    }
+
+-- | Helper to grab the backward result, crashing the compiler if unavailable
+requireBwd :: CompileResult -> BwdResult
+requireBwd res = case backward res of
+    Just b  -> b
+    Nothing -> error "Compiler Bug: Expected reversible computation, but got forward-only."
+
+
+-- | Helper to grab just the backward expression (the snd of the root reconstruction)
+getBwdExpr :: CompileResult -> HsExpr
+getBwdExpr res = reconExpr (bwdRoot (requireBwd res))
+
+-- | Helper to grab just the backward pattern (the fst of the root reconstruction)
+getBwdPat :: CompileResult -> HsPat
+getBwdPat res = reconPat (bwdRoot (requireBwd res))
+
+-- | Helpers to get root information from a backward result
+rootPattern :: BwdResult -> HsPat
+rootPattern = reconPat . bwdRoot
+
+rootExpr :: BwdResult -> HsExpr
+rootExpr = reconExpr . bwdRoot
 
 -- | The Compile Result Representation
 data CompileResult = CompileResult
@@ -146,22 +177,9 @@ data CompileResult = CompileResult
 fwdOnly :: HsExpr -> CompileResult
 fwdOnly e = CompileResult { forward = e, backward = Nothing }
 
--- | Smart constructor for reversible computations
-reversible :: HsExpr -> HsExpr -> HsPat -> [Reconstruction] -> CompileResult
-reversible fwd bwd pat bindings = CompileResult
-    { forward  = fwd
-    , backward = Just (BwdResult { bwdExpr = bwd, bwdPattern = pat, bwdBindings = bindings })
-    }
-
 -- | Helper to grab just the forward expression
 getFwd :: CompileResult -> HsExpr
 getFwd = forward
-
--- | Helper to grab the backward result, crashing the compiler if unavailable
-requireBwd :: CompileResult -> BwdResult
-requireBwd res = case backward res of
-    Just b  -> b
-    Nothing -> error "Compiler Bug: Expected reversible computation, but got forward-only."
 
 -- | Helper to look up a variable's binding kind in the environment
 lookupVar :: Name.Name -> Env -> Maybe BindingKind
@@ -220,7 +238,7 @@ compileBinding ctx (name, ty, expr) =
 
     in case bKind of
         Linear ->
-            let bwdNode = bwdExpr (requireBwd compiled)
+            let bwdNode = getBwdExpr compiled
             in
             [ HBind nameStr (HTuple [HVar (nameStr ++ "_fwd"), HVar (nameStr ++ "_bwd")])
             , HBind (nameStr ++ "_fwd") (getFwd compiled)
@@ -255,7 +273,7 @@ compileExpr ctx expr = case expr of
     Core.Lift e1 e2 ->
         let fwdEx = getFwd (compileExpr ctx e1)
             bwdEx = getFwd (compileExpr ctx e2)
-        in reversible fwdEx bwdEx HPWild []
+        in fwdOnly (HTuple [fwdEx, bwdEx])
 
     Core.Unlift e ->
         fwdOnly (getFwd (compileExpr ctx e))
@@ -294,23 +312,17 @@ compileExpr ctx expr = case expr of
     -- Reversible Constructor Applications
     Core.RCon c es ->
         let compiledArgs = map (compileExpr ctx) es
-
-            -- 1. Fail fast if any argument is not reversible
-            bwdResults = map requireBwd compiledArgs
+            bwdResults   = map requireBwd compiledArgs
 
             fwdArgs = map getFwd compiledArgs
-            bwdArgs = map bwdExpr bwdResults
+            bwdArgs = map rootExpr bwdResults
+            bwdPats = map rootPattern bwdResults
 
-            -- 2. Extract explicitly bound patterns from children
-            bwdPats = map bwdPattern bwdResults
-
-            -- 3. Bubble up all bindings from the arguments
-            childBindings = concatMap bwdBindings bwdResults
+            childBindings = concatMap bwdRecons bwdResults
 
             rawCName = prettyShow c
             cName    = translateConName rawCName
 
-            -- 4. Helpers to build the node and the resulting pattern
             buildNode args = if isTupleName rawCName
                              then HTuple args
                              else foldl HApp (HCon cName) args
@@ -319,15 +331,11 @@ compileExpr ctx expr = case expr of
                             then HPTuple pats
                             else HPCon cName pats
 
-            -- 5. Apply the exact same structural construction to both passes
             fwdNode = buildNode fwdArgs
             bwdNode = buildNode bwdArgs
-
-            -- 6. Create RCon's own structural reconstruction using the true patterns
             rconPat = buildPat bwdPats
-            rconRec = (rconPat, bwdNode)
 
-        in reversible fwdNode bwdNode rconPat (childBindings ++ [rconRec])
+        in reversible fwdNode (Reconstruction rconPat bwdNode) childBindings
 
     Core.Case e alts ->
         let compiledScrut = getFwd (compileExpr ctx e)
