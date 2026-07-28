@@ -235,7 +235,8 @@ compileBackward ctx expr = case expr of
     -- Lambda abstractions
     Core.Abs n e ->
         let varName  = prettyShow n
-            bodyCode = compileBackward ctx e
+            bodyCtx  = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx }
+            bodyCode = compileBackward bodyCtx e
         in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
 
     -- Data constructors
@@ -395,10 +396,20 @@ capitalize (x:xs) = toUpper x : xs
 
 isFunctionTy :: Ty -> Bool
 isFunctionTy ty = case ty of
-    _ :-@ _ -> True
-    TyForAll _ (TyQual _ innerTy) -> isFunctionTy innerTy
-    TySyn _ innerTy -> isFunctionTy innerTy
-    _ -> False
+    _ :-@ _                                           -> True
+    TyCon tc [_, _, _] | "NArrow" `isInfixOf` show tc -> True
+    TyForAll _ (TyQual _ innerTy)                     -> isFunctionTy innerTy
+    TySyn _ innerTy                                   -> isFunctionTy innerTy
+    _                                                 -> False
+
+isShowableTy :: Ty -> Bool
+isShowableTy ty = case ty of
+    _ | isFunctionTy ty           -> False
+    TyVar _                       -> False
+    TyForAll _ (TyQual _ innerTy) -> isShowableTy innerTy
+    TySyn _ innerTy               -> isShowableTy innerTy
+    TyCon _ args                  -> all isShowableTy args
+    _                             -> True
 
 -- Helper function to construct the main IO function that logs all bindings
 constructPutStrLn :: (Name.Name, Ty, Core.Exp Name.Name) -> String
@@ -414,7 +425,7 @@ generateHaskellModule modName typeMap ddecls bindings =
                     }
         generatedDecls = map (compileBinding initCtx) bindings
         compiledDDecls = map compileDDecl ddecls
-        showableBindings = filter (\(_, ty, _) -> not (isFunctionTy ty)) bindings
+        showableBindings = filter (\(_, ty, _) -> isShowableTy ty) bindings
         haskellCode = unlines $
               ["{-# LANGUAGE BangPatterns #-}"
               ,"module " ++ capitalize modName ++ " where"
