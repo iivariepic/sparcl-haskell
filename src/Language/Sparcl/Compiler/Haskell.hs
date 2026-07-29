@@ -277,12 +277,14 @@ compileExpr ctx expr = case expr of
 -- Compiling Specific Expression Node Types
 -- -----------------------------------------------------------------------------------------
 
+-- | Compiling Lift
 compileLift :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
 compileLift ctx e1 e2 =
     let fwdEx = getFwd (compileExpr ctx e1)
         bwdEx = getFwd (compileExpr ctx e2)
     in ForwardOnly (HTuple [fwdEx, bwdEx])
 
+-- | Compiling Unlift
 compileUnlift :: CompileContext -> Core.Exp Name.Name -> CompileResult
 compileUnlift ctx e = case compileExpr ctx e of
     Reversible (RevExpr r) -> ForwardOnly r
@@ -301,6 +303,7 @@ compileUnlift ctx e = case compileExpr ctx e of
 
         in ForwardOnly $ HLet [(HPVar "_bwd_rec", bwdFun)] (HTuple [fwdFun, HVar "_bwd_rec"])
 
+-- | Compiling Variables
 compileVar :: CompileContext -> Name.Name -> CompileResult
 compileVar ctx n =
     let v = formatName (prettyShow n)
@@ -309,6 +312,7 @@ compileVar ctx n =
         Just LinearPat -> Reversible (mkRev (HVar v) (HLam [HPVar "_v"] (HVar "_v")))
         _              -> ForwardOnly (HVar v)
 
+-- | Compiling Lambda Abstractions
 compileAbs :: CompileContext -> Name.Name -> Core.Exp Name.Name -> CompileResult
 compileAbs ctx n body =
     let isLin = maybe False isReversible (lookup n (ctxTypeMap ctx))
@@ -321,6 +325,7 @@ compileAbs ctx n body =
         Reversible r  -> ForwardOnly (HLam [pat] (unRevExpr r))
         ForwardOnly f -> ForwardOnly (HLam [pat] f)
 
+-- | Compiling the function app
 compileApp :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
 compileApp ctx e1 e2 = case e1 of
     Core.App (Core.Var op) lhs | isOperatorName (stripBase (prettyShow op)) ->
@@ -332,6 +337,7 @@ compileApp ctx e1 e2 = case e1 of
             f2 = getRawExpr (compileExpr ctx e2)
         in ForwardOnly (HApp f1 f2)
 
+-- | Compiling non-reversible constructors
 compileCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
 compileCon ctx c es =
     let compiledArgs = map (getFwd . compileExpr ctx) es
@@ -341,6 +347,7 @@ compileCon ctx c es =
             then HTuple compiledArgs
             else foldl HApp (HCon (translateConName rawCName)) compiledArgs
 
+-- | Compiling reversible constructors
 compileRCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
 compileRCon ctx c es =
     let compiledArgs = map (compileExpr ctx) es
@@ -375,6 +382,7 @@ compileRCon ctx c es =
 
             in unRevExpr (mkRev fwdNode bwdClosure)
 
+-- | Compiling non-reversible cases
 compileCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileCase ctx e alts =
     let compiledScrut = getRawExpr (compileExpr ctx e)
@@ -383,12 +391,17 @@ compileCase ctx e alts =
                 altCtx    = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
                 bodyRes   = compileExpr altCtx body
             in ((compilePat pat, getRawExpr bodyRes), bodyRes)
+
         compiledAlts = map compileAlt alts
         hsAlts = map fst compiledAlts
-    in case snd (head compiledAlts) of
-         Reversible _ -> Reversible $ RevExpr $ HCase compiledScrut hsAlts
-         ForwardOnly _ -> ForwardOnly $ HCase compiledScrut hsAlts
 
+    in case compiledAlts of
+         [] -> ForwardOnly $ HCase compiledScrut hsAlts -- Safe fallback for empty case
+         ((_, firstRes) : _) -> case firstRes of
+             Reversible _  -> Reversible $ RevExpr $ HCase compiledScrut hsAlts
+             ForwardOnly _ -> ForwardOnly $ HCase compiledScrut hsAlts
+
+-- | Compiling Let Bindings
 compileLet :: CompileContext -> Core.Bind Name.Name -> Core.Exp Name.Name -> CompileResult
 compileLet ctx binds body =
     let mkVar (n, ty, _) = Variable n (if isReversible ty then LinearArg else Copy)
@@ -401,6 +414,7 @@ compileLet ctx binds body =
         ForwardOnly expr -> ForwardOnly (HLet hsBinds expr)
         Reversible (RevExpr expr) -> Reversible (RevExpr (HLet hsBinds expr))
 
+-- | Compiling Reversible Let Bindings
 compileRPin :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
 compileRPin ctx e1 e2 =
     let res1 = compileExpr ctx e1
@@ -440,33 +454,34 @@ findVars _ _ = []
 
 -- | Dynamically derive the pattern, appending "_res" to avoid shadowing original functions!
 deriveBwdPat :: Core.Exp Name.Name -> [Name.Name] -> HsPat
-deriveBwdPat (Core.RCase _ _) vs =
-    case length vs of
-        0 -> HPTuple []
-        1 -> HPVar (formatName (prettyShow (head vs)) ++ "_res")
-        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
-deriveBwdPat (Core.RPin _ _) vs =
-    case length vs of
-        0 -> HPTuple []
-        1 -> HPVar (formatName (prettyShow (head vs)) ++ "_res")
-        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
+deriveBwdPat (Core.RCase _ _) []  = HPTuple []
+deriveBwdPat (Core.RCase _ _) [v] = HPVar (formatName (prettyShow v) ++ "_res")
+deriveBwdPat (Core.RCase _ _) vs  = HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
+
+deriveBwdPat (Core.RPin _ _) []  = HPTuple []
+deriveBwdPat (Core.RPin _ _) [v] = HPVar (formatName (prettyShow v) ++ "_res")
+deriveBwdPat (Core.RPin _ _) vs  = HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
+
 deriveBwdPat (Core.RCon c args) vs =
     let cName = prettyShow c
     in if isTupleName cName
        then HPTuple (map (`deriveBwdPat` vs) args)
        else HPCon (translateConName cName) (map (`deriveBwdPat` vs) args)
+
 deriveBwdPat (Core.Con c args) vs =
     let cName = prettyShow c
     in if isTupleName cName
        then HPTuple (map (`deriveBwdPat` vs) args)
        else HPCon (translateConName cName) (map (`deriveBwdPat` vs) args)
+
 deriveBwdPat e vs =
     let found = intersect (findVars e vs) vs
-    in case length found of
-        0 -> HPWild
-        1 -> HPVar (formatName (prettyShow (head found)) ++ "_res")
-        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) found)
+    in case found of
+        []  -> HPWild
+        [v] -> HPVar (formatName (prettyShow v) ++ "_res")
+        _   -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) found)
 
+-- | Compiling Reversible Cases
 compileRCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileRCase ctx e alts =
     let resE = compileExpr ctx e
