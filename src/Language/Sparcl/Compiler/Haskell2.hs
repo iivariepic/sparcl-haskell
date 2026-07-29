@@ -122,7 +122,12 @@ data BindingKind
     | Linear     -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
     deriving (Eq, Show)
 
--- | Explicit newtype enforcing the invariant that this expression evaluates to `(fwd, bwd)`.
+-- =========================================================================
+-- REVERSIBLE ABSTRACTIONS
+-- =========================================================================
+
+-- | INVARIANT: A RevExpr is an opaque HsExpr that, at runtime, evaluates to
+--   exactly a 2-tuple: `(forward_pass_value, backward_pass_closure)`.
 newtype RevExpr = RevExpr { unRevExpr :: HsExpr }
     deriving (Eq, Show)
 
@@ -132,12 +137,30 @@ data CompileResult
     | Reversible RevExpr
     deriving (Eq, Show)
 
--- | Helper to grab just the forward expression
-getFwd :: CompileResult -> HsExpr
-getFwd (ForwardOnly e)          = e
-getFwd (Reversible (RevExpr e)) = HLet [(HPTuple [HPVar "_f", HPWild], e)] (HVar "_f")
+-- | Construct a RevExpr from a forward and backward expression.
+mkRev :: HsExpr -> HsExpr -> RevExpr
+mkRev fwd bwd = RevExpr (HTuple [fwd, bwd])
 
--- | Safely extracts the reversible combined expression, crashing if unavailable.
+-- | Continuation-passing helper to safely bind the forward and backward
+--   components of a RevExpr, ensuring no raw tuple manipulation is exposed.
+withRev :: String -> RevExpr -> (HsExpr -> HsExpr -> HsExpr) -> HsExpr
+withRev prefix (RevExpr e) mkBody =
+    let fName = prefix ++ "_fwd"
+        bName = prefix ++ "_bwd"
+    in HLet [(HPTuple [HPVar fName, HPVar bName], e)]
+            (mkBody (HVar fName) (HVar bName))
+
+-- | Unpack a CompileResult if you explicitly need the raw underlying HsExpr.
+revExpr :: CompileResult -> HsExpr
+revExpr (Reversible (RevExpr e)) = e
+revExpr (ForwardOnly _) = error "Compiler Bug: Expected reversible computation, but got forward-only."
+
+-- | Safely extracts the forward value.
+getFwd :: CompileResult -> HsExpr
+getFwd (ForwardOnly e) = e
+getFwd (Reversible r)  = withRev "_fwd_ext" r const
+
+-- | Safely asserts and extracts the RevExpr.
 getReversible :: CompileResult -> RevExpr
 getReversible (Reversible r)  = r
 getReversible (ForwardOnly _) = error "Compiler Bug: Expected reversible computation, but got forward-only."
@@ -205,10 +228,10 @@ compileBinding ctx (name, ty, expr) =
         compiled = compileExpr initBodyCtx expr
 
     in case (bKind, compiled) of
-        (Linear, Reversible (RevExpr tupleExpr)) ->
-            [ HBind nameStr tupleExpr
-            , HBind (nameStr ++ "_fwd") (HLet [(HPTuple [HPVar "_f", HPWild], HVar nameStr)] (HVar "_f"))
-            , HBind (nameStr ++ "_bwd") (HLet [(HPTuple [HPWild, HPVar "_b"], HVar nameStr)] (HVar "_b"))
+        (Linear, Reversible r) ->
+            [ HBind nameStr (revExpr compiled)
+            , HBind (nameStr ++ "_fwd") (withRev "top" r const)
+            , HBind (nameStr ++ "_bwd") (withRev "top" r (\_ b -> b))
             ]
         (Linear, ForwardOnly _) ->
             error "Compiler Bug: Expected reversible computation for Linear binding, but got forward-only."
@@ -281,26 +304,17 @@ compileApp ctx e1 e2 = case e1 of
             res2 = compileExpr ctx e2
         in if isReversibleExpr ctx e1
            then
-               let (argExpr, bwd2Expr, extraBinds) = case res2 of
-                        Reversible (RevExpr expr) ->
-                            ( HVar "_arg"
-                            , HVar "_bwdArg"
-                            , [(HPTuple [HPVar "_arg", HPVar "_bwdArg"], expr)]
-                            )
-                        ForwardOnly expr ->
-                            ( expr, HError "Compiler bug: Expected linear argument", [] )
-
-                   binds = (HPTuple [HPVar "_fwdFn", HPVar "_bwdFn"], unRevExpr (getReversible res1)) : extraBinds
-
-                   fwdCall = HApp (HVar "_fwdFn") argExpr
-
-                   callBwdFn = HApp (HVar "_bwdFn") (HVar "_val")
-                   bwdClosure = HLam [HPVar "_val"] $
-                                    HLet [(HPVar "_dx", callBwdFn)] (HApp bwd2Expr (HVar "_dx"))
-
-                   combined = HLet binds (HTuple [fwdCall, bwdClosure])
-
-               in Reversible (RevExpr combined)
+               let wrapArg bodyFn = case res2 of
+                       Reversible r     -> withRev "_arg" r bodyFn
+                       ForwardOnly expr -> bodyFn expr (HError "Compiler bug: Expected linear argument")
+               in Reversible $ RevExpr $
+                   wrapArg $ \argFwd argBwd ->
+                       withRev "_fn" (getReversible res1) $ \fwdFn bwdFn ->
+                           let fwdCall    = HApp fwdFn argFwd
+                               callBwdFn  = HApp bwdFn (HVar "_val")
+                               bwdClosure = HLam [HPVar "_val"] $
+                                                HLet [(HPVar "_dx", callBwdFn)] (HApp argBwd (HVar "_dx"))
+                           in unRevExpr (mkRev fwdCall bwdClosure)
            else
                ForwardOnly (HApp (getFwd res1) (getFwd res2))
 
@@ -319,41 +333,37 @@ compileRCon ctx c es =
         rawCName = prettyShow c
         cName    = translateConName rawCName
 
-        buildArg i (Reversible (RevExpr expr)) =
-            let fName = "_f" ++ show i
-                bName = "_b" ++ show i
-            in (HPTuple [HPVar fName, HPVar bName], expr, HVar fName, HVar bName)
-        buildArg _ (ForwardOnly expr) =
-            (HPWild, expr, expr, HError "Compiler Bug: Expected reversible arg")
+        -- Recursively unpacks all RevExpr arguments so we can map them.
+        buildArgs :: Int -> [CompileResult] -> ([HsExpr] -> [HsExpr] -> HsExpr) -> HsExpr
+        buildArgs _ [] k = k [] []
+        buildArgs i (res:rest) k = case res of
+            Reversible r ->
+                withRev ("_a" ++ show i) r $ \fwd bwd ->
+                    buildArgs (i+1) rest $ \fs bs -> k (fwd:fs) (bwd:bs)
+            ForwardOnly expr ->
+                buildArgs (i+1) rest $ \fs bs -> k (expr:fs) (HError "Compiler Bug":bs)
 
-        argsInfo = zipWith buildArg [1..] compiledArgs
+    in Reversible $ RevExpr $
+        buildArgs 1 compiledArgs $ \fwdArgs bwdArgs ->
 
-        letBinds = [(pat, expr) | (pat, expr, _, _) <- argsInfo, pat /= HPWild]
-        fwdArgs  = [f | (_, _, f, _) <- argsInfo]
-        bwdArgs  = [b | (_, _, _, b) <- argsInfo]
+            -- 1. Forward Constructor Application
+            let fwdNode = if isTupleName rawCName
+                          then HTuple fwdArgs
+                          else foldl HApp (HCon cName) fwdArgs
 
-        -- Forward Constructor Application
-        fwdNode = if isTupleName rawCName
-                  then HTuple fwdArgs
-                  else foldl HApp (HCon cName) fwdArgs
+            -- 2. Backward Reconstructor logic directly using target AST
+                argNames = [ "_val" ++ show i | i <- [1..length es] ]
+                argPats  = map HPVar argNames
+                pat = if isTupleName rawCName then HPTuple argPats else HPCon cName argPats
 
-        -- Backward Reconstructor logic directly using target AST
-        argNames = [ "_a" ++ show i | i <- [1..length es] ]
-        argPats  = map HPVar argNames
-        pat = if isTupleName rawCName then HPTuple argPats else HPCon cName argPats
+                reconArgs = zipWith (\bwd argName -> HApp bwd (HVar argName)) bwdArgs argNames
+                reconBody = if isTupleName rawCName
+                            then HTuple reconArgs
+                            else foldl HApp (HCon cName) reconArgs
 
-        reconArgs = zipWith (\bwd argName -> HApp bwd (HVar argName)) bwdArgs argNames
-        reconBody = if isTupleName rawCName
-                    then HTuple reconArgs
-                    else foldl HApp (HCon cName) reconArgs
+                bwdClosure = HLam [HPVar "_val"] (HCase (HVar "_val") [(pat, reconBody)])
 
-        bwdClosure = HLam [HPVar "_val"] (HCase (HVar "_val") [(pat, reconBody)])
-
-        combined = if null letBinds
-                   then HTuple [fwdNode, bwdClosure]
-                   else HLet letBinds (HTuple [fwdNode, bwdClosure])
-
-    in Reversible (RevExpr combined)
+            in unRevExpr (mkRev fwdNode bwdClosure)
 
 compileCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileCase ctx e alts =
