@@ -287,11 +287,43 @@ compileVar ctx n =
 
 compileAbs :: CompileContext -> Name.Name -> Core.Exp Name.Name -> CompileResult
 compileAbs ctx n body =
-    let varObj  = Variable n Copy
+    let -- 1. Dynamically look up the variable's type to determine if it is Linear or Copy.
+        isLin = maybe False isReversible (lookup n (ctxTypeMap ctx))
+        kind  = if isLin then Linear else Copy
+
+        -- 2. Bind it in the local environment and compile the body
+        varObj  = Variable n kind
         bodyCtx = ctx { ctxEnv = varObj : ctxEnv ctx }
         compiledBody = compileExpr bodyCtx body
         pat = HPVar (formatName (prettyShow n))
-    in ForwardOnly (HLam [pat] (getFwd compiledBody))
+    in
+    case kind of
+        Copy ->
+            -- For static/unrestricted arguments
+            -- we keep the forward and backward passes natively coupled in a single lambda.
+            case compiledBody of
+                Reversible r ->
+                    ForwardOnly (HLam [pat] (unRevExpr r))
+                ForwardOnly f ->
+                    ForwardOnly (HLam [pat] f)
+
+        Linear ->
+            -- For first-class reversible functions
+            -- we construct a Reversible computation encapsulating the forward and backward closures.
+            case compiledBody of
+                Reversible r ->
+                    let -- fwdFun takes the linear argument and executes the forward pass of the body
+                        fwdFun = HLam [pat] (getFwd compiledBody)
+
+                        -- bwdFun extracts the dynamically constructed backward closure from the body.
+                        bwdFun = withRev "_bwd_ext" r (\_fwd bwd -> bwd)
+                    in
+                    -- We must return a Reversible here so that `compileApp` and top-level
+                    -- bindings can safely invoke `getReversible` on it!
+                    Reversible (mkRev fwdFun bwdFun)
+
+                ForwardOnly _ ->
+                    ForwardOnly (HError "Compiler Bug: Linear lambda must wrap a reversible body")
 
 compileApp :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
 compileApp ctx e1 e2 = case e1 of
