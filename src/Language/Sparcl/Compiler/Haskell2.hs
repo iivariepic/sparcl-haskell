@@ -103,8 +103,6 @@ prettyHsDecl decl = case decl of
             rhs = intercalate " | " [ unwords (c : args) | (c, args) <- cons ]
         in "data " ++ lhs ++ " = " ++ rhs ++ " deriving Show"
 
--- | Data type that tells us if we are inside a reversible binding
-data ContextMode = Outside | Inside deriving (Eq, Show)
 
 data Variable = Variable
     { varName :: Name.Name
@@ -117,7 +115,6 @@ type Env = [Variable]
 data CompileContext = CompileContext
     { ctxTypeMap :: [(Name.Name, PolyTy)]
     , ctxEnv     :: Env
-    , ctxMode    :: ContextMode
     }
 
 -- | Data type that defines the nature of a bound variable in the current scope
@@ -126,66 +123,63 @@ data BindingKind
     | Linear     -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
     deriving (Eq, Show)
 
--- | Represents the reconstruction of a value in the backward pass
-data Reconstruction = Reconstruction
-    { reconPat  :: HsPat
-    , reconExpr :: HsExpr
-    } deriving (Eq, Show)
+-- | A Haskell-oriented intermediate representation for backward computations.
+data BwdTree
+    = BwdExpr HsExpr                    -- ^ An embedded target expression
+    | BwdCon String [BwdTree]           -- ^ Reconstruct a Data Constructor
+    | BwdTuple [BwdTree]                -- ^ Reconstruct a Tuple specifically
+    | BwdCall BwdTree BwdTree           -- ^ Invoke a backward closure with an argument
+    | BwdBind HsPat BwdTree BwdTree     -- ^ Evaluate a tree, bind its result, and continue
+    | BwdLam [HsPat] BwdTree            -- ^ Express a backward closure boundary natively
+    | BwdCase BwdTree [(HsPat, BwdTree)]-- ^ Pattern match safely within the backward AST
+    deriving (Eq, Show)
 
--- | The Backward Pass structure natively tracking its own root pattern and child bindings
-data BwdResult = BwdResult
-    { bwdRoot     :: Reconstruction
-    , bwdRecons :: [Reconstruction]
-    } deriving (Eq, Show)
+-- | Lower the semantic backward tree directly into an executable Haskell AST.
+lowerBwdTree :: BwdTree -> HsExpr
+lowerBwdTree tree = case tree of
+    BwdExpr e ->
+        e
 
--- | Smart constructor for reversible computations
-reversible :: HsExpr -> Reconstruction -> [Reconstruction] -> CompileResult
-reversible fwd root children = CompileResult
-    { forward  = fwd
-    , backward = Just (BwdResult root children)
-    }
+    BwdCon c args ->
+        foldl HApp (HCon (translateConName c)) (map lowerBwdTree args)
 
--- | Helper to grab the backward result, crashing the compiler if unavailable
-requireBwd :: CompileResult -> BwdResult
-requireBwd res = case backward res of
-    Just b  -> b
-    Nothing -> error "Compiler Bug: Expected reversible computation, but got forward-only."
+    BwdTuple args ->
+        HTuple (map lowerBwdTree args)
 
+    BwdCall bwdFn bwdArg ->
+        HApp (lowerBwdTree bwdFn) (lowerBwdTree bwdArg)
 
--- | Helper to grab just the backward expression (the snd of the root reconstruction)
-getBwdExpr :: CompileResult -> HsExpr
-getBwdExpr res = reconExpr (bwdRoot (requireBwd res))
+    BwdBind pat boundTree bodyTree ->
+        HLet [(pat, lowerBwdTree boundTree)] (lowerBwdTree bodyTree)
 
--- | Helper to grab just the backward pattern (the fst of the root reconstruction)
-getBwdPat :: CompileResult -> HsPat
-getBwdPat res = reconPat (bwdRoot (requireBwd res))
+    BwdLam pats body ->
+        HLam pats (lowerBwdTree body)
 
--- | Helpers to get root information from a backward result
-rootPattern :: BwdResult -> HsPat
-rootPattern = reconPat . bwdRoot
-
-rootExpr :: BwdResult -> HsExpr
-rootExpr = reconExpr . bwdRoot
+    BwdCase scrut alts ->
+        HCase (lowerBwdTree scrut) [(p, lowerBwdTree b) | (p, b) <- alts]
 
 -- | The Compile Result Representation
-data CompileResult = CompileResult
-    { forward  :: HsExpr
-    , backward :: Maybe BwdResult
-    } deriving (Eq, Show)
-
--- | Smart constructor for forward-only computations
-fwdOnly :: HsExpr -> CompileResult
-fwdOnly e = CompileResult { forward = e, backward = Nothing }
+data CompileResult
+    = ForwardOnly HsExpr
+    | Reversible HsExpr BwdTree
+    deriving (Eq, Show)
 
 -- | Helper to grab just the forward expression
 getFwd :: CompileResult -> HsExpr
-getFwd = forward
+getFwd (ForwardOnly e)  = e
+getFwd (Reversible e _) = e
+
+-- | Safely extracts the backward tree, crashing with a bug report if unavailable.
+requireBwd :: CompileResult -> BwdTree
+requireBwd (Reversible _ b) = b
+requireBwd (ForwardOnly _) =
+    error "Compiler bug: expected reversible computation"
 
 -- | Helper to look up a variable's binding kind in the environment
 lookupVar :: Name.Name -> Env -> Maybe BindingKind
 lookupVar n env = listToMaybe [ kind | Variable vName kind <- env, vName == n ]
 
--- | Helper function to check if binding is reversible structurally
+-- | Helper function to check if type is reversible structurally
 isReversible :: Ty -> Bool
 isReversible ty = case ty of
     (_ :-@ _) -> True
@@ -201,6 +195,18 @@ isReversibleSpine ty = case ty of
     TyCon c _ | prettyShow c `elem` ["rev", "NRev", "(rev)"] -> True
     TyForAll _ (TyQual _ innerTy) -> isReversibleSpine innerTy
     TySyn _ innerTy               -> isReversibleSpine innerTy
+    _ -> False
+
+-- | Helper function to check if expression is reversible
+-- NOTE: This implies an assumption that (((f a) b) c) is reversible iff f is.
+-- Future improvement: Utilize a type-checker to query `exprType ctx e`.
+isReversibleExpr :: CompileContext -> Core.Exp Name.Name -> Bool
+isReversibleExpr ctx expr = case expr of
+    Core.Var n ->
+        maybe False isReversible (lookup n (ctxTypeMap ctx))
+    Core.App e1 _ ->
+        isReversibleExpr ctx e1
+    Core.RCon _ _ -> True
     _ -> False
 
 -- | Helper to extract all bound variables from a pattern
@@ -229,22 +235,21 @@ translateConName name
 compileBinding :: CompileContext -> (Name.Name, Ty, Core.Exp Name.Name) -> [HsDecl]
 compileBinding ctx (name, ty, expr) =
     let nameStr = formatName (prettyShow name)
-
         bKind = if isReversible ty then Linear else Copy
-        bMode = if isReversible ty then Inside else Outside
-
-        initBodyCtx = ctx { ctxEnv = Variable name bKind : ctxEnv ctx, ctxMode = bMode }
+        initBodyCtx = ctx { ctxEnv = Variable name bKind : ctxEnv ctx }
         compiled = compileExpr initBodyCtx expr
 
-    in case bKind of
-        Linear ->
-            let bwdNode = getBwdExpr compiled
+    in case (bKind, compiled) of
+        (Linear, Reversible fwdNode bwdNodeTree) ->
+            let bwdNode = lowerBwdTree bwdNodeTree
             in
             [ HBind nameStr (HTuple [HVar (nameStr ++ "_fwd"), HVar (nameStr ++ "_bwd")])
-            , HBind (nameStr ++ "_fwd") (getFwd compiled)
+            , HBind (nameStr ++ "_fwd") fwdNode
             , HBind (nameStr ++ "_bwd") bwdNode
             ]
-        Copy ->
+        (Linear, ForwardOnly _) ->
+            error "Compiler Bug: Expected reversible computation for Linear binding, but got forward-only."
+        (Copy, _) ->
             [ HBind nameStr (getFwd compiled) ]
 
 -- | Translate Sparcl Patterns to Haskell Patterns
@@ -263,99 +268,127 @@ compileLiteral :: Literal.Literal -> HsExpr
 compileLiteral (Literal.LitInt i) = HLit (show i)
 compileLiteral _ = HError "Unhandled literal type"
 
--- | The expression compilation pass
+-- | The expression compilation pass routing to specialized helpers
 compileExpr :: CompileContext -> Core.Exp Name.Name -> CompileResult
 compileExpr ctx expr = case expr of
+    Core.Lit l       -> ForwardOnly (compileLiteral l)
+    Core.Lift e1 e2  -> compileLift ctx e1 e2
+    Core.Unlift e    -> ForwardOnly (getFwd (compileExpr ctx e))
+    Core.Var n       -> compileVar ctx n
+    Core.Abs n body  -> compileAbs ctx n body
+    Core.App e1 e2   -> compileApp ctx e1 e2
+    Core.Con c es    -> compileCon ctx c es
+    Core.RCon c es   -> compileRCon ctx c es
+    Core.Case e alts -> compileCase ctx e alts
+    _                -> ForwardOnly (HError "Not implemented")
 
-    Core.Lit l ->
-        fwdOnly (compileLiteral l)
+-- -----------------------------------------------------------------------------------------
+-- Compiling Specific Expression Node Types
+-- -----------------------------------------------------------------------------------------
 
-    Core.Lift e1 e2 ->
-        let fwdEx = getFwd (compileExpr ctx e1)
-            bwdEx = getFwd (compileExpr ctx e2)
-        in fwdOnly (HTuple [fwdEx, bwdEx])
+compileLift :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
+compileLift ctx e1 e2 =
+    let fwdEx = getFwd (compileExpr ctx e1)
+        bwdEx = getFwd (compileExpr ctx e2)
+    in ForwardOnly (HTuple [fwdEx, bwdEx])
 
-    Core.Unlift e ->
-        fwdOnly (getFwd (compileExpr ctx e))
+compileVar :: CompileContext -> Name.Name -> CompileResult
+compileVar ctx n =
+    let v = formatName (prettyShow n)
+    in case lookupVar n (ctxEnv ctx) of
+        Just Linear ->
+            -- Project out the fwd and bwd explicitly from the tuple bound to the linear variable
+            let fwd = HLet [(HPTuple [HPVar "_fwdFn", HPWild], HVar v)] (HVar "_fwdFn")
+                bwd = BwdBind (HPTuple [HPWild, HPVar "_bwdFn"]) (BwdExpr (HVar v)) (BwdExpr (HVar "_bwdFn"))
+            in Reversible fwd bwd
+        _ ->
+            ForwardOnly (HVar v)
 
-    Core.Var n ->
-        let v = formatName (prettyShow n)
-        in case lookupVar n (ctxEnv ctx) of
-            Just Linear ->
-                reversible
-                    (HVar v)
-                    (Reconstruction (HPVar v) (HVar v))
-                    []
-            _ ->
-                fwdOnly (HVar v)
+compileAbs :: CompileContext -> Name.Name -> Core.Exp Name.Name -> CompileResult
+compileAbs ctx n body =
+    let varObj  = Variable n Copy
+        bodyCtx = ctx { ctxEnv = varObj : ctxEnv ctx }
+        compiledBody = compileExpr bodyCtx body
+        pat = HPVar (formatName (prettyShow n))
+    in ForwardOnly (HLam [pat] (getFwd compiledBody))
 
-    Core.Abs n body ->
-        let varObj  = Variable n Copy
-            bodyCtx = ctx { ctxEnv = varObj : ctxEnv ctx }
-            compiledBody = compileExpr bodyCtx body
-            pat = HPVar (formatName (prettyShow n))
-        in fwdOnly (HLam [pat] (getFwd compiledBody))
-
-    Core.App (Core.App (Core.Var op) lhs) rhs
-            | let opStr = stripBase (prettyShow op), isOperatorName opStr ->
-                let l = getFwd (compileExpr ctx lhs)
-                    r = getFwd (compileExpr ctx rhs)
-                in fwdOnly (HOp opStr l r)
-
-    -- General Application
-    Core.App e1 e2 ->
+compileApp :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
+compileApp ctx e1 e2 = case e1 of
+    Core.App (Core.Var op) lhs | isOperatorName (stripBase (prettyShow op)) ->
+        let l = getFwd (compileExpr ctx lhs)
+            r = getFwd (compileExpr ctx e2)
+        in ForwardOnly (HOp (stripBase (prettyShow op)) l r)
+    _ ->
         let res1 = compileExpr ctx e1
             res2 = compileExpr ctx e2
-        in fwdOnly (HApp (getFwd res1) (getFwd res2))
+        in if isReversibleExpr ctx e1
+           then
+               let -- FORWARD PASS: Project closures
+                   fwdTuple = getFwd res1
+                   projBinds = [(HPTuple [HPVar "_fwdFn", HPVar "_bwdFn"], fwdTuple)]
+                   fwdCall   = HLet projBinds (HApp (HVar "_fwdFn") (getFwd res2))
 
-    -- Constructor Applications
-    Core.Con c es ->
-        let compiledArgs = map (getFwd . compileExpr ctx) es
-            rawCName     = prettyShow c
-        in fwdOnly $
-            if isTupleName rawCName
-                then HTuple compiledArgs
-                else foldl HApp (HCon (translateConName rawCName)) compiledArgs
+                   -- BACKWARD PASS: Build closure to handle incoming update
+                   -- Explicitly bind `_bwdFn` using the evaluated function tuple from `e1`.
+                   -- Note: Evaluating `fwdTuple` again duplicates its evaluation in generated Haskell.
+                   -- Depending on runtime optimization (or let-floating algorithms later),
+                   -- we might want to lift these to shared let-bindings externally.
+                   callBwdFn = BwdCall (BwdExpr (HVar "_bwdFn")) (BwdExpr (HVar "_val"))
+                   bwdTree = BwdLam [HPVar "_val"] $
+                                BwdBind (HPTuple [HPWild, HPVar "_bwdFn"]) (BwdExpr fwdTuple) $
+                                BwdBind (HPVar "_dx") callBwdFn (BwdCall (requireBwd res2) (BwdExpr (HVar "_dx")))
 
-    -- Reversible Constructor Applications
-    Core.RCon c es ->
-        let compiledArgs = map (compileExpr ctx) es
-            bwdResults   = map requireBwd compiledArgs
+               in Reversible fwdCall bwdTree
+           else
+               ForwardOnly (HApp (getFwd res1) (getFwd res2))
 
-            fwdArgs = map getFwd compiledArgs
-            bwdArgs = map rootExpr bwdResults
-            bwdPats = map rootPattern bwdResults
+compileCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
+compileCon ctx c es =
+    let compiledArgs = map (getFwd . compileExpr ctx) es
+        rawCName     = prettyShow c
+    in ForwardOnly $
+        if isTupleName rawCName
+            then HTuple compiledArgs
+            else foldl HApp (HCon (translateConName rawCName)) compiledArgs
 
-            childBindings = concatMap bwdRecons bwdResults
+compileRCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
+compileRCon ctx c es =
+    let compiledArgs = map (compileExpr ctx) es
+        fwdArgs      = map getFwd compiledArgs
+        bwdArgs      = map requireBwd compiledArgs
 
-            rawCName = prettyShow c
-            cName    = translateConName rawCName
+        rawCName = prettyShow c
+        cName    = translateConName rawCName
 
-            buildNode args = if isTupleName rawCName
-                             then HTuple args
-                             else foldl HApp (HCon cName) args
+        -- Forward Value
+        fwdNode = if isTupleName rawCName
+                  then HTuple fwdArgs
+                  else foldl HApp (HCon cName) fwdArgs
 
-            buildPat pats = if isTupleName rawCName
-                            then HPTuple pats
-                            else HPCon cName pats
+        -- Backward Reconstructor
+        argNames = [ "_a" ++ show i | i <- [1..length es] ]
+        argPats  = map HPVar argNames
+        pat = if isTupleName rawCName then HPTuple argPats else HPCon cName argPats
 
-            fwdNode = buildNode fwdArgs
-            bwdNode = buildNode bwdArgs
-            rconPat = buildPat bwdPats
+        reconArgs = zipWith (\bwd argName -> BwdCall bwd (BwdExpr (HVar argName))) bwdArgs argNames
+        reconBody = if isTupleName rawCName
+                    then BwdTuple reconArgs
+                    else BwdCon rawCName reconArgs
 
-        in reversible fwdNode (Reconstruction rconPat bwdNode) childBindings
+        bwdNode = BwdLam [HPVar "_val"] (BwdCase (BwdExpr (HVar "_val")) [(pat, reconBody)])
 
-    Core.Case e alts ->
-        let compiledScrut = getFwd (compileExpr ctx e)
-            compileAlt (pat, body) =
-                let boundVars = map (\v -> Variable v Copy) (patVars pat)
-                    altCtx    = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
-                    bodyRes   = compileExpr altCtx body
-                in (compilePat pat, getFwd bodyRes)
-            compiledAlts = map compileAlt alts
-        in fwdOnly (HCase compiledScrut compiledAlts)
+    in Reversible fwdNode bwdNode
 
-    _ -> fwdOnly (HError "Not implemented")
+compileCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name)] -> CompileResult
+compileCase ctx e alts =
+    let compiledScrut = getFwd (compileExpr ctx e)
+        compileAlt (pat, body) =
+            let boundVars = map (`Variable` Copy) (patVars pat)
+                altCtx    = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                bodyRes   = compileExpr altCtx body
+            in (compilePat pat, getFwd bodyRes)
+        compiledAlts = map compileAlt alts
+    in ForwardOnly (HCase compiledScrut compiledAlts)
 
 
 -- | Function to compile data declarations
@@ -368,7 +401,7 @@ compileDDecl (Core.DDecl dataName tyVars constructors) =
             then "data " ++ nameStr
             else "data " ++ nameStr ++ " " ++ tyVarStrs
 
-        compileCon (conName, _existentials, _constraints, argTypes) =
+        compileCons (conName, _existentials, _constraints, argTypes) =
             let cNameStr = translateConName (prettyShow conName)
                 formatArg ty =
                     let typeStr = prettyShow ty
@@ -380,7 +413,7 @@ compileDDecl (Core.DDecl dataName tyVars constructors) =
                 then cNameStr
                 else cNameStr ++ " " ++ argsStr
 
-        rhs = intercalate " | " (map compileCon constructors)
+        rhs = intercalate " | " (map compileCons constructors)
     in
         lhs ++ " = " ++ rhs ++ " deriving Show"
 
@@ -413,7 +446,7 @@ constructPutStrLn (name, _, _) = "\"\\n" ++ prettyShow name ++ ": \" ++ show " +
 generateHaskellModule :: String -> [(Name.Name, PolyTy)] -> [Core.DDecl Name.Name] -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
 generateHaskellModule modName typeMap ddecls bindings =
     let
-        initCtx = CompileContext { ctxTypeMap = typeMap, ctxEnv = [], ctxMode = Outside }
+        initCtx = CompileContext { ctxTypeMap = typeMap, ctxEnv = [] }
 
         generatedDecls = concatMap (map prettyHsDecl . compileBinding initCtx) bindings
         compiledDDecls = map compileDDecl ddecls
