@@ -190,16 +190,7 @@ patVars pat = case pat of
     Core.PVar n      -> [n]
     Core.PCon _ args -> concatMap patVars args
 
--- | Helper to turn a pattern back into an expression for backward reconstruction
-patToExp :: Core.Pat Name.Name -> HsExpr
-patToExp (Core.PVar n) = HVar (formatName (prettyShow n))
-patToExp (Core.PCon c ps) =
-    let rawCName = prettyShow c
-    in if isTupleName rawCName
-       then HTuple (map patToExp ps)
-       else foldl HApp (HCon (translateConName rawCName)) (map patToExp ps)
-
--- | A safe pattern reconstructor that uses the un-shadowed "_res" variables!
+-- | A safe pattern reconstructor that uses "_res" variables
 patToExpRes :: Core.Pat Name.Name -> HsExpr
 patToExpRes (Core.PVar n) = HVar (formatName (prettyShow n) ++ "_res")
 patToExpRes (Core.PCon c ps) =
