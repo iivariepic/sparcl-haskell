@@ -152,6 +152,11 @@ withRev prefix (RevExpr e) mkBody =
     in HLet [(HPTuple [HPVar fName, HPVar bName], e)]
             (mkBody (HVar fName) (HVar bName))
 
+-- | Helper to get a reversible expression from both CompileResult types
+toRev :: CompileResult -> RevExpr
+toRev (Reversible r) = r
+toRev (ForwardOnly e) = RevExpr e
+
 -- | Safely extracts the forward value.
 getFwd :: CompileResult -> HsExpr
 getFwd (ForwardOnly e) = e
@@ -343,9 +348,7 @@ compileRCon ctx c es =
         buildArgs :: Int -> [CompileResult] -> ([HsExpr] -> [HsExpr] -> HsExpr) -> HsExpr
         buildArgs _ [] k = k [] []
         buildArgs i (res:rest) k =
-            let r = case res of
-                        Reversible rev -> rev
-                        ForwardOnly expr -> RevExpr expr
+            let r = toRev res
             in withRev ("_a" ++ show i) r $ \fwd bwd ->
                 buildArgs (i+1) rest $ \fs bs -> k (fwd:fs) (bwd:bs)
 
@@ -405,9 +408,7 @@ compileRPin :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> Com
 compileRPin ctx e1 e2 =
     let res1 = compileExpr ctx e1
         fwd_e2 = getFwd (compileExpr ctx e2)
-        r1 = case res1 of
-                Reversible r -> r
-                ForwardOnly expr -> RevExpr expr
+        r1 = toRev res1
     in Reversible $ RevExpr $
         withRev "_pin" r1 $ \fwd_e1 bwd_e1 ->
             let fwdNode = fwd_e1
@@ -471,9 +472,7 @@ deriveBwdPat e vs =
 compileRCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileRCase ctx e alts =
     let resE = compileExpr ctx e
-        rE = case resE of
-                Reversible r -> r
-                ForwardOnly expr -> RevExpr expr
+        rE = toRev resE
     in Reversible $ RevExpr $
         withRev "_rcase" rE $ \fwdE bwdE ->
 
@@ -481,9 +480,7 @@ compileRCase ctx e alts =
                     let boundVars = map (`Variable` LinearPat) (patVars pat)
                         altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
                         resBody = compileExpr altCtx body
-                        rBody = case resBody of
-                                    Reversible r -> r
-                                    ForwardOnly expr -> RevExpr expr
+                        rBody = toRev resBody
                     -- The forward case only returns the forward value.
                     in (compilePat pat, withRev "_alt" rBody const)
 
@@ -493,9 +490,7 @@ compileRCase ctx e alts =
                 buildBwd ((pat, body, cond):rest) =
                     let boundVars = map (`Variable` LinearPat) (patVars pat)
                         altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
-                        rBody = case compileExpr altCtx body of
-                                    Reversible r -> r
-                                    ForwardOnly expr -> RevExpr expr
+                        rBody = toRev (compileExpr altCtx body)
 
                         allLinVars = nub [ v | Variable v kind <- ctxEnv altCtx
                                              , kind `elem` [LinearArg, LinearPat] || prettyShow v == "k" ]
