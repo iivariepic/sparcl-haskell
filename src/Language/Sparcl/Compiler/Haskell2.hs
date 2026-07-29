@@ -257,16 +257,18 @@ compileLiteral _ = HError "Unhandled literal type"
 -- | The expression compilation pass routing to specialized helpers
 compileExpr :: CompileContext -> Core.Exp Name.Name -> CompileResult
 compileExpr ctx expr = case expr of
-    Core.Lit l       -> ForwardOnly (compileLiteral l)
-    Core.Lift e1 e2  -> compileLift ctx e1 e2
-    Core.Unlift e    -> ForwardOnly (getFwd (compileExpr ctx e))
-    Core.Var n       -> compileVar ctx n
-    Core.Abs n body  -> compileAbs ctx n body
-    Core.App e1 e2   -> compileApp ctx e1 e2
-    Core.Con c es    -> compileCon ctx c es
-    Core.RCon c es   -> compileRCon ctx c es
-    Core.Case e alts -> compileCase ctx e alts
-    _                -> ForwardOnly (HError "Not implemented")
+    Core.Lit l          -> ForwardOnly (compileLiteral l)
+    Core.Lift e1 e2     -> compileLift ctx e1 e2
+    Core.Unlift e       -> ForwardOnly (getFwd (compileExpr ctx e))
+    Core.Var n          -> compileVar ctx n
+    Core.Abs n body     -> compileAbs ctx n body
+    Core.App e1 e2      -> compileApp ctx e1 e2
+    Core.Con c es       -> compileCon ctx c es
+    Core.RCon c es      -> compileRCon ctx c es
+    Core.Case e alts    -> compileCase ctx e alts
+    Core.Let binds body -> compileLet ctx binds body
+    Core.RPin e1 e2     -> ForwardOnly (HError "Not implemented")
+    Core.RCase e rAlts  -> ForwardOnly (HError "Not implemented")
 
 -- -----------------------------------------------------------------------------------------
 -- Compiling Specific Expression Node Types
@@ -408,6 +410,38 @@ compileCase ctx e alts =
         compiledAlts = map compileAlt alts
     in ForwardOnly (HCase compiledScrut compiledAlts)
 
+compileLet :: CompileContext -> Core.Bind Name.Name -> Core.Exp Name.Name -> CompileResult
+compileLet ctx binds body =
+    let -- 1. Determine the BindingKind for each let-bound variable based on its type
+        mkVar (n, ty, _) = Variable n (if isReversible ty then Linear else Copy)
+        newVars = map mkVar binds
+
+        -- 2. Extend the context with the new bindings.
+        bodyCtx = ctx { ctxEnv = newVars ++ ctxEnv ctx }
+
+        -- Helper to safely extract the underlying Haskell AST node
+        -- regardless of whether the right-hand side is a forward-only value or a reversible tuple.
+        getRawExpr :: CompileResult -> HsExpr
+        getRawExpr (ForwardOnly expr) = expr
+        getRawExpr (Reversible (RevExpr expr)) = expr
+
+        -- 3. Compile the right-hand side of each binding
+        compileBind (n, _ty, e) =
+            let pat = HPVar (formatName (prettyShow n))
+                compiledE = compileExpr bodyCtx e
+            in (pat, getRawExpr compiledE)
+
+        hsBinds = map compileBind binds
+
+        -- 4. Compile the let body
+        compiledBody = compileExpr bodyCtx body
+
+    in case compiledBody of
+        ForwardOnly expr ->
+            ForwardOnly (HLet hsBinds expr)
+
+        Reversible (RevExpr expr) ->
+            Reversible (RevExpr (HLet hsBinds expr))
 
 -- | Function to compile data declarations
 compileDDecl :: Core.DDecl Name.Name -> String
