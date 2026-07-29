@@ -118,9 +118,15 @@ data CompileContext = CompileContext
 
 -- | Data type that defines the nature of a bound variable in the current scope
 data BindingKind
-    = Copy       -- ^ Belongs to \Gamma (can be duplicated/dropped freely)
-    | Linear     -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
+    = Copy        -- ^ Belongs to \Gamma (can be duplicated/dropped freely)
+    | LinearArg   -- ^ A full reversible tuple passed as an argument
+    | LinearPat   -- ^ A reversible variable bound inside a forward pattern match
     deriving (Eq, Show)
+
+-- | Helper to safely extract the underlying Haskell AST node
+getRawExpr :: CompileResult -> HsExpr
+getRawExpr (ForwardOnly expr) = expr
+getRawExpr (Reversible (RevExpr expr)) = expr
 
 -- =========================================================================
 -- REVERSIBLE ABSTRACTIONS
@@ -187,21 +193,20 @@ isReversibleSpine ty = case ty of
     TySyn _ innerTy               -> isReversibleSpine innerTy
     _ -> False
 
--- | Helper function to check if expression is reversible
--- NOTE: This implies an assumption that (((f a) b) c) is reversible iff f is.
--- Future improvement: Utilize a type-checker to query `exprType ctx e`.
-isReversibleExpr :: CompileContext -> Core.Exp Name.Name -> Bool
-isReversibleExpr ctx expr = case expr of
-    Core.Var n -> maybe False isReversible (lookup n (ctxTypeMap ctx))
-    Core.App e1 _ -> isReversibleExpr ctx e1
-    Core.RCon _ _ -> True
-    _ -> False
-
 -- | Helper to extract all bound variables from a pattern
 patVars :: Core.Pat Name.Name -> [Name.Name]
 patVars pat = case pat of
     Core.PVar n      -> [n]
     Core.PCon _ args -> concatMap patVars args
+
+-- | Helper to turn a pattern back into an expression for backward reconstruction
+patToExp :: Core.Pat Name.Name -> HsExpr
+patToExp (Core.PVar n) = HVar (formatName (prettyShow n))
+patToExp (Core.PCon c ps) =
+    let rawCName = prettyShow c
+    in if isTupleName rawCName
+       then HTuple (map patToExp ps)
+       else foldl HApp (HCon (translateConName rawCName)) (map patToExp ps)
 
 -- | Helper function to format names to valid Haskell
 formatName :: String -> String
@@ -221,22 +226,11 @@ translateConName name
 
 -- | Compile a top-level binding into a list of Haskell AST declarations
 compileBinding :: CompileContext -> (Name.Name, Ty, Core.Exp Name.Name) -> [HsDecl]
-compileBinding ctx (name, ty, expr) =
+compileBinding ctx (name, _, expr) =
     let nameStr = formatName (prettyShow name)
-        bKind = if isReversible ty then Linear else Copy
-        initBodyCtx = ctx { ctxEnv = Variable name bKind : ctxEnv ctx }
+        initBodyCtx = ctx { ctxEnv = Variable name Copy : ctxEnv ctx }
         compiled = compileExpr initBodyCtx expr
-
-    in case (bKind, compiled) of
-        (Linear, Reversible r) ->
-            [ HBind nameStr (revExpr compiled)
-            , HBind (nameStr ++ "_fwd") (withRev "top" r const)
-            , HBind (nameStr ++ "_bwd") (withRev "top" r (\_ b -> b))
-            ]
-        (Linear, ForwardOnly _) ->
-            error "Compiler Bug: Expected reversible computation for Linear binding, but got forward-only."
-        (Copy, _) ->
-            [ HBind nameStr (getFwd compiled) ]
+    in [ HBind nameStr (getRawExpr compiled) ]
 
 -- | Translate Sparcl Patterns to Haskell Patterns
 compilePat :: Core.Pat Name.Name -> HsPat
@@ -259,7 +253,7 @@ compileExpr :: CompileContext -> Core.Exp Name.Name -> CompileResult
 compileExpr ctx expr = case expr of
     Core.Lit l          -> ForwardOnly (compileLiteral l)
     Core.Lift e1 e2     -> compileLift ctx e1 e2
-    Core.Unlift e       -> ForwardOnly (getFwd (compileExpr ctx e))
+    Core.Unlift e       -> compileUnlift ctx e
     Core.Var n          -> compileVar ctx n
     Core.Abs n body     -> compileAbs ctx n body
     Core.App e1 e2      -> compileApp ctx e1 e2
@@ -280,77 +274,54 @@ compileLift ctx e1 e2 =
         bwdEx = getFwd (compileExpr ctx e2)
     in ForwardOnly (HTuple [fwdEx, bwdEx])
 
+compileUnlift :: CompileContext -> Core.Exp Name.Name -> CompileResult
+compileUnlift ctx e = case compileExpr ctx e of
+    Reversible (RevExpr r) -> ForwardOnly r
+    ForwardOnly h ->
+        let wrappedAs = HTuple [HVar "_as", HLam [HPVar "_v"] (HVar "_v")]
+
+            fwdFun = HLam [HPVar "_as"] $
+                HLet [(HPTuple [HPVar "_fwd_val", HPWild], HApp h wrappedAs)]
+                     (HVar "_fwd_val")
+
+            bwdFun = HLam [HPVar "_out"] $
+                HLet [ (HPVar "_as", HApp (HVar "_bwd_rec") (HVar "_out"))
+                     , (HPTuple [HPWild, HPVar "_bwd_closure"], HApp h wrappedAs)
+                     ]
+                     (HApp (HVar "_bwd_closure") (HVar "_out"))
+
+        in ForwardOnly $ HLet [(HPVar "_bwd_rec", bwdFun)] (HTuple [fwdFun, HVar "_bwd_rec"])
+
 compileVar :: CompileContext -> Name.Name -> CompileResult
 compileVar ctx n =
     let v = formatName (prettyShow n)
     in case lookupVar n (ctxEnv ctx) of
-        Just Linear -> Reversible (RevExpr (HVar v))
-        _           -> ForwardOnly (HVar v)
+        Just LinearArg -> Reversible (RevExpr (HVar v))
+        Just LinearPat -> Reversible (mkRev (HVar v) (HLam [HPVar "_v"] (HVar "_v")))
+        _              -> ForwardOnly (HVar v)
 
 compileAbs :: CompileContext -> Name.Name -> Core.Exp Name.Name -> CompileResult
 compileAbs ctx n body =
-    let -- 1. Dynamically look up the variable's type to determine if it is Linear or Copy.
-        isLin = maybe False isReversible (lookup n (ctxTypeMap ctx))
-        kind  = if isLin then Linear else Copy
-
-        -- 2. Bind it in the local environment and compile the body
+    let isLin = maybe False isReversible (lookup n (ctxTypeMap ctx))
+        kind  = if isLin then LinearArg else Copy
         varObj  = Variable n kind
         bodyCtx = ctx { ctxEnv = varObj : ctxEnv ctx }
         compiledBody = compileExpr bodyCtx body
         pat = HPVar (formatName (prettyShow n))
-    in
-    case kind of
-        Copy ->
-            -- For static/unrestricted arguments
-            -- we keep the forward and backward passes natively coupled in a single lambda.
-            case compiledBody of
-                Reversible r ->
-                    ForwardOnly (HLam [pat] (unRevExpr r))
-                ForwardOnly f ->
-                    ForwardOnly (HLam [pat] f)
-
-        Linear ->
-            -- For first-class reversible functions
-            -- we construct a Reversible computation encapsulating the forward and backward closures.
-            case compiledBody of
-                Reversible r ->
-                    let -- fwdFun takes the linear argument and executes the forward pass of the body
-                        fwdFun = HLam [pat] (getFwd compiledBody)
-
-                        -- bwdFun extracts the dynamically constructed backward closure from the body.
-                        bwdFun = withRev "_bwd_ext" r (\_fwd bwd -> bwd)
-                    in
-                    -- We must return a Reversible here so that `compileApp` and top-level
-                    -- bindings can safely invoke `getReversible` on it!
-                    Reversible (mkRev fwdFun bwdFun)
-
-                ForwardOnly _ ->
-                    ForwardOnly (HError "Compiler Bug: Linear lambda must wrap a reversible body")
+    in case compiledBody of
+        Reversible r  -> ForwardOnly (HLam [pat] (unRevExpr r))
+        ForwardOnly f -> ForwardOnly (HLam [pat] f)
 
 compileApp :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
 compileApp ctx e1 e2 = case e1 of
     Core.App (Core.Var op) lhs | isOperatorName (stripBase (prettyShow op)) ->
-        let l = getFwd (compileExpr ctx lhs)
-            r = getFwd (compileExpr ctx e2)
+        let l = getRawExpr (compileExpr ctx lhs)
+            r = getRawExpr (compileExpr ctx e2)
         in ForwardOnly (HOp (stripBase (prettyShow op)) l r)
     _ ->
-        let res1 = compileExpr ctx e1
-            res2 = compileExpr ctx e2
-        in if isReversibleExpr ctx e1
-           then
-               let wrapArg bodyFn = case res2 of
-                       Reversible r     -> withRev "_arg" r bodyFn
-                       ForwardOnly expr -> bodyFn expr (HError "Compiler bug: Expected linear argument")
-               in Reversible $ RevExpr $
-                   wrapArg $ \argFwd argBwd ->
-                       withRev "_fn" (getReversible res1) $ \fwdFn bwdFn ->
-                           let fwdCall    = HApp fwdFn argFwd
-                               callBwdFn  = HApp bwdFn (HVar "_val")
-                               bwdClosure = HLam [HPVar "_val"] $
-                                                HLet [(HPVar "_dx", callBwdFn)] (HApp argBwd (HVar "_dx"))
-                           in unRevExpr (mkRev fwdCall bwdClosure)
-           else
-               ForwardOnly (HApp (getFwd res1) (getFwd res2))
+        let f1 = getRawExpr (compileExpr ctx e1)
+            f2 = getRawExpr (compileExpr ctx e2)
+        in ForwardOnly (HApp f1 f2)
 
 compileCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
 compileCon ctx c es =
@@ -367,25 +338,21 @@ compileRCon ctx c es =
         rawCName = prettyShow c
         cName    = translateConName rawCName
 
-        -- Recursively unpacks all RevExpr arguments so we can map them.
         buildArgs :: Int -> [CompileResult] -> ([HsExpr] -> [HsExpr] -> HsExpr) -> HsExpr
         buildArgs _ [] k = k [] []
-        buildArgs i (res:rest) k = case res of
-            Reversible r ->
-                withRev ("_a" ++ show i) r $ \fwd bwd ->
-                    buildArgs (i+1) rest $ \fs bs -> k (fwd:fs) (bwd:bs)
-            ForwardOnly expr ->
-                buildArgs (i+1) rest $ \fs bs -> k (expr:fs) (HError "Compiler Bug":bs)
+        buildArgs i (res:rest) k =
+            let r = case res of
+                        Reversible rev -> rev
+                        ForwardOnly expr -> RevExpr expr
+            in withRev ("_a" ++ show i) r $ \fwd bwd ->
+                buildArgs (i+1) rest $ \fs bs -> k (fwd:fs) (bwd:bs)
 
     in Reversible $ RevExpr $
         buildArgs 1 compiledArgs $ \fwdArgs bwdArgs ->
-
-            -- 1. Forward Constructor Application
             let fwdNode = if isTupleName rawCName
                           then HTuple fwdArgs
                           else foldl HApp (HCon cName) fwdArgs
 
-            -- 2. Backward Reconstructor logic directly using target AST
                 argNames = [ "_val" ++ show i | i <- [1..length es] ]
                 argPats  = map HPVar argNames
                 pat = if isTupleName rawCName then HPTuple argPats else HPCon cName argPats
@@ -401,107 +368,93 @@ compileRCon ctx c es =
 
 compileCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileCase ctx e alts =
-    let compiledScrut = getFwd (compileExpr ctx e)
+    let compiledScrut = getRawExpr (compileExpr ctx e)
         compileAlt (pat, body) =
             let boundVars = map (`Variable` Copy) (patVars pat)
                 altCtx    = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
                 bodyRes   = compileExpr altCtx body
-            in (compilePat pat, getFwd bodyRes)
+            in ((compilePat pat, getRawExpr bodyRes), bodyRes)
         compiledAlts = map compileAlt alts
-    in ForwardOnly (HCase compiledScrut compiledAlts)
+        hsAlts = map fst compiledAlts
+    in case snd (head compiledAlts) of
+         Reversible _ -> Reversible $ RevExpr $ HCase compiledScrut hsAlts
+         ForwardOnly _ -> ForwardOnly $ HCase compiledScrut hsAlts
 
 compileLet :: CompileContext -> Core.Bind Name.Name -> Core.Exp Name.Name -> CompileResult
 compileLet ctx binds body =
-    let -- 1. Determine the BindingKind for each let-bound variable based on its type
-        mkVar (n, ty, _) = Variable n (if isReversible ty then Linear else Copy)
+    let mkVar (n, ty, _) = Variable n (if isReversible ty then LinearArg else Copy)
         newVars = map mkVar binds
-
-        -- 2. Extend the context with the new bindings.
         bodyCtx = ctx { ctxEnv = newVars ++ ctxEnv ctx }
-
-        -- Helper to safely extract the underlying Haskell AST node
-        -- regardless of whether the right-hand side is a forward-only value or a reversible tuple.
-        getRawExpr :: CompileResult -> HsExpr
-        getRawExpr (ForwardOnly expr) = expr
-        getRawExpr (Reversible (RevExpr expr)) = expr
-
-        -- 3. Compile the right-hand side of each binding
-        compileBind (n, _ty, e) =
-            let pat = HPVar (formatName (prettyShow n))
-                compiledE = compileExpr bodyCtx e
-            in (pat, getRawExpr compiledE)
-
+        compileBind (n, _ty, e) = (HPVar (formatName (prettyShow n)), getRawExpr (compileExpr bodyCtx e))
         hsBinds = map compileBind binds
-
-        -- 4. Compile the let body
         compiledBody = compileExpr bodyCtx body
-
     in case compiledBody of
-        ForwardOnly expr ->
-            ForwardOnly (HLet hsBinds expr)
-
-        Reversible (RevExpr expr) ->
-            Reversible (RevExpr (HLet hsBinds expr))
+        ForwardOnly expr -> ForwardOnly (HLet hsBinds expr)
+        Reversible (RevExpr expr) -> Reversible (RevExpr (HLet hsBinds expr))
 
 compileRPin :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
 compileRPin ctx e1 e2 =
     let res1 = compileExpr ctx e1
         fwd_e2 = getFwd (compileExpr ctx e2)
-    in case res1 of
-        ForwardOnly _ ->
-            ForwardOnly (HError "Compiler Bug: RPin applied to non-reversible expression")
-        Reversible r -> Reversible $ RevExpr $
-            withRev "_pin" r $ \fwd_e1 bwd_e1 ->
-                let -- Forward pass ignores the predicate
-                    fwdNode = fwd_e1
-
-                    -- Backward pass applies the predicate.
-                    -- If True, it continues evaluating backwards. If False, it fails.
-                    bwdNode = HLam [HPVar "_out"] $
-                        HIf (HApp fwd_e2 (HVar "_out"))
-                            (HApp bwd_e1 (HVar "_out"))
-                            (HError "Pin predicate failed: Branch mismatch in backward pass")
-
-                in unRevExpr (mkRev fwdNode bwdNode)
+        r1 = case res1 of
+                Reversible r -> r
+                ForwardOnly expr -> RevExpr expr
+    in Reversible $ RevExpr $
+        withRev "_pin" r1 $ \fwd_e1 bwd_e1 ->
+            let fwdNode = fwd_e1
+                bwdNode = HLam [HPVar "_out"] $
+                    HIf (HApp fwd_e2 (HVar "_out"))
+                        (HApp bwd_e1 (HVar "_out"))
+                        (HError "Pin predicate failed: Branch mismatch in backward pass")
+            in unRevExpr (mkRev fwdNode bwdNode)
 
 compileRCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileRCase ctx e alts =
     let resE = compileExpr ctx e
-    in case resE of
-        ForwardOnly _ ->
-            ForwardOnly (HError "Compiler Bug: RCase applied to non-reversible expression")
-        Reversible rE -> Reversible $ RevExpr $
-            withRev "_rcase" rE $ \fwdE bwdE ->
+        rE = case resE of
+                Reversible r -> r
+                ForwardOnly expr -> RevExpr expr
+    in Reversible $ RevExpr $
+        withRev "_rcase" rE $ \fwdE bwdE ->
 
-                -- 1. Forward pass: A standard HCase (we ignore the backward condition)
-                -- Note: Assuming the AST tuple is (Pattern, Body, Condition).
-                -- If it's (Pattern, Condition, Body), simply swap `body` and `_cond` here.
-                let compileFwdAlt (pat, body, _cond) =
-                        -- The bound variables are Linear!
-                        let boundVars = map (`Variable` Linear) (patVars pat)
-                            altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
-                            resBody = compileExpr altCtx body
-                        in (compilePat pat, getFwd resBody)
+            -- FIX: Coerce the body to a RevExpr (just like we do in the backward pass)
+            -- and safely extract ONLY the forward value using withRev.
+            let compileFwdAlt (pat, body, _cond) =
+                    let boundVars = map (`Variable` LinearPat) (patVars pat)
+                        altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                        resBody = compileExpr altCtx body
+                        rBody = case resBody of
+                                    Reversible r -> r
+                                    ForwardOnly expr -> RevExpr expr
+                    in (compilePat pat, withRev "_alt" rBody (\fwd _bwd -> fwd))
 
-                    fwdNode = HCase fwdE (map compileFwdAlt alts)
+                fwdNode = HCase fwdE (map compileFwdAlt alts)
 
-                    -- 2. Backward pass
-                    bwdNode = case alts of
-                        -- If it is a `let rev p <- e1 in e2` binding, there is exactly one alternative.
-                        [(pat, body, _cond)] ->
-                            let boundVars = map (`Variable` Linear) (patVars pat)
-                                altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
-                                resBody = getReversible (compileExpr altCtx body)
+                buildBwd [] = HError "RCase backward match failed"
+                buildBwd ((pat, body, cond):rest) =
+                    let boundVars = map (`Variable` LinearPat) (patVars pat)
+                        altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                        rBody = case compileExpr altCtx body of
+                                    Reversible r -> r
+                                    ForwardOnly expr -> RevExpr expr
 
-                            -- We compose the backward closures: bwdE (bwdBody out)
-                            in withRev "_body" resBody $ \_fwdBody bwdBody ->
-                                HLam [HPVar "_out"] (HApp bwdE (HApp bwdBody (HVar "_out")))
+                        -- Reconstruct the pattern for bwdE, strictly evaluating bwdBody
+                        branchExec = withRev "_body" rBody $ \_fwdBody bwdBody ->
+                            let patExpr = patToExp pat
+                            in HLet [ (HPBang HPWild, HApp bwdBody (HVar "_out")) ]
+                                    (HApp bwdE patExpr)
 
-                        -- True multi-branch RCase backward routing requires inverse patterns,
-                        -- which is beyond a simple AST translation pass.
-                        _ -> HError "RCase with multiple branches not implemented for backward pass"
+                        condCheck = HApp (getRawExpr (compileExpr ctx cond)) (HVar "_out")
 
-                in unRevExpr (mkRev fwdNode bwdNode)
+                        -- Mask out of scope linear variables using an un-evaluated HLet block
+                        dummyBinds = [ (HPVar (formatName (prettyShow v)), HError "Unreachable forward pass var") | v <- patVars pat ]
+                        execWithDummies = if null dummyBinds then branchExec else HLet dummyBinds branchExec
+
+                    in HIf condCheck execWithDummies (buildBwd rest)
+
+                bwdNode = HLam [HPVar "_out"] (buildBwd alts)
+
+            in unRevExpr (mkRev fwdNode bwdNode)
 
 -- | Function to compile data declarations
 compileDDecl :: Core.DDecl Name.Name -> String
