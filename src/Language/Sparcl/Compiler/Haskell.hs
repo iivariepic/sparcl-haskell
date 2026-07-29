@@ -569,6 +569,10 @@ generateHaskellModule modName typeMap ddecls bindings =
 
         showableBindings = filter (\(_, ty, _) -> isShowableTy ty) bindings
 
+        printStr = if null showableBindings
+                   then "\"\""
+                   else intercalate " ++ " (map constructPutStrLn showableBindings)
+
         haskellCode = unlines $
               ["module " ++ capitalize modName ++ " where"
               , ""
@@ -576,7 +580,7 @@ generateHaskellModule modName typeMap ddecls bindings =
               ] ++ compiledDDecls ++
               [ ""
               , "main :: IO ()"
-              , "main = putStrLn (" ++ intercalate " ++ " (map constructPutStrLn showableBindings) ++ ")"
+              , "main = putStrLn (" ++ printStr ++ ")"
               , ""
               , intercalate "\n\n" generatedDecls]
     in (haskellCode, ".hs")
