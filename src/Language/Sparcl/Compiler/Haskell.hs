@@ -217,6 +217,11 @@ translateConName name
         in "(" ++ replicate (n - 1) ',' ++ ")"
     | otherwise = name
 
+-- | Semantic mapping for Sparcl primitive functions to Haskell native equivalents
+translatePrimitive :: String -> String
+translatePrimitive "leInt"  = "(<=)"
+translatePrimitive other    = other
+
 -- | Compile a top-level binding into a list of Haskell AST declarations
 compileBinding :: CompileContext -> (Name.Name, Ty, Core.Exp Name.Name) -> [HsDecl]
 compileBinding ctx (name, _, expr) =
@@ -290,7 +295,10 @@ compileUnlift ctx e = case compileExpr ctx e of
 -- | Compiling Variables
 compileVar :: CompileContext -> Name.Name -> CompileResult
 compileVar ctx n =
-    let v = formatName (prettyShow n)
+    -- 1. Syntactically format the name (strip Base, add parens)
+    let formatted = formatName (prettyShow n)
+    -- 2. Semantically translate Sparcl primitives to Haskell natives
+        v = translatePrimitive formatted
     in case lookupVar n (ctxEnv ctx) of
         Just LinearArg -> Reversible (RevExpr (HVar v))
         Just LinearPat -> Reversible (mkRev (HVar v) (HLam [HPVar "_v"] (HVar "_v")))
