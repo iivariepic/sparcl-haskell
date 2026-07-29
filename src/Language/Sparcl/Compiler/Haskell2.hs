@@ -25,7 +25,7 @@ data HsExpr
     | HCon String
     | HLit String
     | HApp HsExpr HsExpr
-    | HOp String HsExpr HsExpr -- ^ Added for infix operators
+    | HOp String HsExpr HsExpr
     | HLam [HsPat] HsExpr
     | HLet [(HsPat, HsExpr)] HsExpr
     | HCase HsExpr [(HsPat, HsExpr)]
@@ -103,7 +103,6 @@ prettyHsDecl decl = case decl of
             rhs = intercalate " | " [ unwords (c : args) | (c, args) <- cons ]
         in "data " ++ lhs ++ " = " ++ rhs ++ " deriving Show"
 
-
 data Variable = Variable
     { varName :: Name.Name
     , varKind :: BindingKind
@@ -123,57 +122,25 @@ data BindingKind
     | Linear     -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
     deriving (Eq, Show)
 
--- | A Haskell-oriented intermediate representation for backward computations.
-data BwdTree
-    = BwdExpr HsExpr                    -- ^ An embedded target expression
-    | BwdCon String [BwdTree]           -- ^ Reconstruct a Data Constructor
-    | BwdTuple [BwdTree]                -- ^ Reconstruct a Tuple specifically
-    | BwdCall BwdTree BwdTree           -- ^ Invoke a backward closure with an argument
-    | BwdBind HsPat BwdTree BwdTree     -- ^ Evaluate a tree, bind its result, and continue
-    | BwdLam [HsPat] BwdTree            -- ^ Express a backward closure boundary natively
-    | BwdCase BwdTree [(HsPat, BwdTree)]-- ^ Pattern match safely within the backward AST
+-- | Explicit newtype enforcing the invariant that this expression evaluates to `(fwd, bwd)`.
+newtype RevExpr = RevExpr { unRevExpr :: HsExpr }
     deriving (Eq, Show)
-
--- | Lower the semantic backward tree directly into an executable Haskell AST.
-lowerBwdTree :: BwdTree -> HsExpr
-lowerBwdTree tree = case tree of
-    BwdExpr e ->
-        e
-
-    BwdCon c args ->
-        foldl HApp (HCon (translateConName c)) (map lowerBwdTree args)
-
-    BwdTuple args ->
-        HTuple (map lowerBwdTree args)
-
-    BwdCall bwdFn bwdArg ->
-        HApp (lowerBwdTree bwdFn) (lowerBwdTree bwdArg)
-
-    BwdBind pat boundTree bodyTree ->
-        HLet [(pat, lowerBwdTree boundTree)] (lowerBwdTree bodyTree)
-
-    BwdLam pats body ->
-        HLam pats (lowerBwdTree body)
-
-    BwdCase scrut alts ->
-        HCase (lowerBwdTree scrut) [(p, lowerBwdTree b) | (p, b) <- alts]
 
 -- | The Compile Result Representation
 data CompileResult
     = ForwardOnly HsExpr
-    | Reversible HsExpr BwdTree
+    | Reversible RevExpr
     deriving (Eq, Show)
 
 -- | Helper to grab just the forward expression
 getFwd :: CompileResult -> HsExpr
-getFwd (ForwardOnly e)  = e
-getFwd (Reversible e _) = e
+getFwd (ForwardOnly e)          = e
+getFwd (Reversible (RevExpr e)) = HLet [(HPTuple [HPVar "_f", HPWild], e)] (HVar "_f")
 
--- | Safely extracts the backward tree, crashing with a bug report if unavailable.
-requireBwd :: CompileResult -> BwdTree
-requireBwd (Reversible _ b) = b
-requireBwd (ForwardOnly _) =
-    error "Compiler bug: expected reversible computation"
+-- | Safely extracts the reversible combined expression, crashing if unavailable.
+getReversible :: CompileResult -> RevExpr
+getReversible (Reversible r)  = r
+getReversible (ForwardOnly _) = error "Compiler Bug: Expected reversible computation, but got forward-only."
 
 -- | Helper to look up a variable's binding kind in the environment
 lookupVar :: Name.Name -> Env -> Maybe BindingKind
@@ -202,10 +169,8 @@ isReversibleSpine ty = case ty of
 -- Future improvement: Utilize a type-checker to query `exprType ctx e`.
 isReversibleExpr :: CompileContext -> Core.Exp Name.Name -> Bool
 isReversibleExpr ctx expr = case expr of
-    Core.Var n ->
-        maybe False isReversible (lookup n (ctxTypeMap ctx))
-    Core.App e1 _ ->
-        isReversibleExpr ctx e1
+    Core.Var n -> maybe False isReversible (lookup n (ctxTypeMap ctx))
+    Core.App e1 _ -> isReversibleExpr ctx e1
     Core.RCon _ _ -> True
     _ -> False
 
@@ -240,12 +205,10 @@ compileBinding ctx (name, ty, expr) =
         compiled = compileExpr initBodyCtx expr
 
     in case (bKind, compiled) of
-        (Linear, Reversible fwdNode bwdNodeTree) ->
-            let bwdNode = lowerBwdTree bwdNodeTree
-            in
-            [ HBind nameStr (HTuple [HVar (nameStr ++ "_fwd"), HVar (nameStr ++ "_bwd")])
-            , HBind (nameStr ++ "_fwd") fwdNode
-            , HBind (nameStr ++ "_bwd") bwdNode
+        (Linear, Reversible (RevExpr tupleExpr)) ->
+            [ HBind nameStr tupleExpr
+            , HBind (nameStr ++ "_fwd") (HLet [(HPTuple [HPVar "_f", HPWild], HVar nameStr)] (HVar "_f"))
+            , HBind (nameStr ++ "_bwd") (HLet [(HPTuple [HPWild, HPVar "_b"], HVar nameStr)] (HVar "_b"))
             ]
         (Linear, ForwardOnly _) ->
             error "Compiler Bug: Expected reversible computation for Linear binding, but got forward-only."
@@ -296,13 +259,8 @@ compileVar :: CompileContext -> Name.Name -> CompileResult
 compileVar ctx n =
     let v = formatName (prettyShow n)
     in case lookupVar n (ctxEnv ctx) of
-        Just Linear ->
-            -- Project out the fwd and bwd explicitly from the tuple bound to the linear variable
-            let fwd = HLet [(HPTuple [HPVar "_fwdFn", HPWild], HVar v)] (HVar "_fwdFn")
-                bwd = BwdBind (HPTuple [HPWild, HPVar "_bwdFn"]) (BwdExpr (HVar v)) (BwdExpr (HVar "_bwdFn"))
-            in Reversible fwd bwd
-        _ ->
-            ForwardOnly (HVar v)
+        Just Linear -> Reversible (RevExpr (HVar v))
+        _           -> ForwardOnly (HVar v)
 
 compileAbs :: CompileContext -> Name.Name -> Core.Exp Name.Name -> CompileResult
 compileAbs ctx n body =
@@ -323,22 +281,26 @@ compileApp ctx e1 e2 = case e1 of
             res2 = compileExpr ctx e2
         in if isReversibleExpr ctx e1
            then
-               let -- FORWARD PASS: Project closures
-                   fwdTuple = getFwd res1
-                   projBinds = [(HPTuple [HPVar "_fwdFn", HPVar "_bwdFn"], fwdTuple)]
-                   fwdCall   = HLet projBinds (HApp (HVar "_fwdFn") (getFwd res2))
+               let (argExpr, bwd2Expr, extraBinds) = case res2 of
+                        Reversible (RevExpr expr) ->
+                            ( HVar "_arg"
+                            , HVar "_bwdArg"
+                            , [(HPTuple [HPVar "_arg", HPVar "_bwdArg"], expr)]
+                            )
+                        ForwardOnly expr ->
+                            ( expr, HError "Compiler bug: Expected linear argument", [] )
 
-                   -- BACKWARD PASS: Build closure to handle incoming update
-                   -- Explicitly bind `_bwdFn` using the evaluated function tuple from `e1`.
-                   -- Note: Evaluating `fwdTuple` again duplicates its evaluation in generated Haskell.
-                   -- Depending on runtime optimization (or let-floating algorithms later),
-                   -- we might want to lift these to shared let-bindings externally.
-                   callBwdFn = BwdCall (BwdExpr (HVar "_bwdFn")) (BwdExpr (HVar "_val"))
-                   bwdTree = BwdLam [HPVar "_val"] $
-                                BwdBind (HPTuple [HPWild, HPVar "_bwdFn"]) (BwdExpr fwdTuple) $
-                                BwdBind (HPVar "_dx") callBwdFn (BwdCall (requireBwd res2) (BwdExpr (HVar "_dx")))
+                   binds = (HPTuple [HPVar "_fwdFn", HPVar "_bwdFn"], unRevExpr (getReversible res1)) : extraBinds
 
-               in Reversible fwdCall bwdTree
+                   fwdCall = HApp (HVar "_fwdFn") argExpr
+
+                   callBwdFn = HApp (HVar "_bwdFn") (HVar "_val")
+                   bwdClosure = HLam [HPVar "_val"] $
+                                    HLet [(HPVar "_dx", callBwdFn)] (HApp bwd2Expr (HVar "_dx"))
+
+                   combined = HLet binds (HTuple [fwdCall, bwdClosure])
+
+               in Reversible (RevExpr combined)
            else
                ForwardOnly (HApp (getFwd res1) (getFwd res2))
 
@@ -354,30 +316,44 @@ compileCon ctx c es =
 compileRCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
 compileRCon ctx c es =
     let compiledArgs = map (compileExpr ctx) es
-        fwdArgs      = map getFwd compiledArgs
-        bwdArgs      = map requireBwd compiledArgs
-
         rawCName = prettyShow c
         cName    = translateConName rawCName
 
-        -- Forward Value
+        buildArg i (Reversible (RevExpr expr)) =
+            let fName = "_f" ++ show i
+                bName = "_b" ++ show i
+            in (HPTuple [HPVar fName, HPVar bName], expr, HVar fName, HVar bName)
+        buildArg _ (ForwardOnly expr) =
+            (HPWild, expr, expr, HError "Compiler Bug: Expected reversible arg")
+
+        argsInfo = zipWith buildArg [1..] compiledArgs
+
+        letBinds = [(pat, expr) | (pat, expr, _, _) <- argsInfo, pat /= HPWild]
+        fwdArgs  = [f | (_, _, f, _) <- argsInfo]
+        bwdArgs  = [b | (_, _, _, b) <- argsInfo]
+
+        -- Forward Constructor Application
         fwdNode = if isTupleName rawCName
                   then HTuple fwdArgs
                   else foldl HApp (HCon cName) fwdArgs
 
-        -- Backward Reconstructor
+        -- Backward Reconstructor logic directly using target AST
         argNames = [ "_a" ++ show i | i <- [1..length es] ]
         argPats  = map HPVar argNames
         pat = if isTupleName rawCName then HPTuple argPats else HPCon cName argPats
 
-        reconArgs = zipWith (\bwd argName -> BwdCall bwd (BwdExpr (HVar argName))) bwdArgs argNames
+        reconArgs = zipWith (\bwd argName -> HApp bwd (HVar argName)) bwdArgs argNames
         reconBody = if isTupleName rawCName
-                    then BwdTuple reconArgs
-                    else BwdCon rawCName reconArgs
+                    then HTuple reconArgs
+                    else foldl HApp (HCon cName) reconArgs
 
-        bwdNode = BwdLam [HPVar "_val"] (BwdCase (BwdExpr (HVar "_val")) [(pat, reconBody)])
+        bwdClosure = HLam [HPVar "_val"] (HCase (HVar "_val") [(pat, reconBody)])
 
-    in Reversible fwdNode bwdNode
+        combined = if null letBinds
+                   then HTuple [fwdNode, bwdClosure]
+                   else HLet letBinds (HTuple [fwdNode, bwdClosure])
+
+    in Reversible (RevExpr combined)
 
 compileCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileCase ctx e alts =
