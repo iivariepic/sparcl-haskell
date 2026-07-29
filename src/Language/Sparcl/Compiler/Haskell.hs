@@ -13,10 +13,8 @@ import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@),
 data HsPat
     = HPVar String
     | HPCon String [HsPat]
-    | HPOp String HsPat HsPat
     | HPTuple [HsPat]
     | HPWild
-    | HPBang HsPat
     deriving (Eq, Show)
 
 -- | Target Haskell Expressions
@@ -74,10 +72,8 @@ prettyHsPat pat = case pat of
     HPVar v       -> v
     HPCon c []    -> c
     HPCon c ps    -> "(" ++ c ++ " " ++ unwords (map prettyHsPat ps) ++ ")"
-    HPOp op p1 p2 -> "(" ++ prettyHsPat p1 ++ " " ++ op ++ " " ++ prettyHsPat p2 ++ ")"
     HPTuple ps    -> "(" ++ intercalate ", " (map prettyHsPat ps) ++ ")"
     HPWild        -> "_"
-    HPBang p      -> "!" ++ prettyHsPat p
 
 -- | Pretty print target expressions
 prettyHsExpr :: Int -> HsExpr -> String
@@ -156,20 +152,10 @@ withRev prefix (RevExpr e) mkBody =
     in HLet [(HPTuple [HPVar fName, HPVar bName], e)]
             (mkBody (HVar fName) (HVar bName))
 
--- | Unpack a CompileResult if you explicitly need the raw underlying HsExpr.
-revExpr :: CompileResult -> HsExpr
-revExpr (Reversible (RevExpr e)) = e
-revExpr (ForwardOnly _) = error "Compiler Bug: Expected reversible computation, but got forward-only."
-
 -- | Safely extracts the forward value.
 getFwd :: CompileResult -> HsExpr
 getFwd (ForwardOnly e) = e
 getFwd (Reversible r)  = withRev "_fwd_ext" r const
-
--- | Safely asserts and extracts the RevExpr.
-getReversible :: CompileResult -> RevExpr
-getReversible (Reversible r)  = r
-getReversible (ForwardOnly _) = error "Compiler Bug: Expected reversible computation, but got forward-only."
 
 -- | Helper to look up a variable's binding kind in the environment
 lookupVar :: Name.Name -> Env -> Maybe BindingKind
@@ -541,15 +527,12 @@ compileRCase ctx e alts =
 
             in unRevExpr (mkRev fwdNode bwdNode)
 
--- | Function to compile data declarations
-compileDDecl :: Core.DDecl Name.Name -> String
+-- | Function to compile data declarations into the target AST
+compileDDecl :: Core.DDecl Name.Name -> HsDecl
 compileDDecl (Core.DDecl dataName tyVars constructors) =
     let
-        nameStr = prettyShow dataName
-        tyVarStrs = unwords (map prettyShow tyVars)
-        lhs = if null tyVars
-            then "data " ++ nameStr
-            else "data " ++ nameStr ++ " " ++ tyVarStrs
+        dNameStr = prettyShow dataName
+        tyVarStrs = map prettyShow tyVars
 
         compileCons (conName, _existentials, _constraints, argTypes) =
             let cNameStr = translateConName (prettyShow conName)
@@ -558,14 +541,11 @@ compileDDecl (Core.DDecl dataName tyVars constructors) =
                     in if ' ' `elem` typeStr && not ("(" `isPrefixOf` typeStr)
                         then "(" ++ typeStr ++ ")"
                         else typeStr
-                argsStr = unwords (map formatArg argTypes)
-            in if null argTypes
-                then cNameStr
-                else cNameStr ++ " " ++ argsStr
+            in (cNameStr, map formatArg argTypes)
 
-        rhs = intercalate " | " (map compileCons constructors)
+        consDecls = map compileCons constructors
     in
-        lhs ++ " = " ++ rhs ++ " deriving Show"
+        HData dNameStr tyVarStrs consDecls
 
 -- | Helper function to capitalize first character of a string
 capitalize :: String -> String
@@ -599,12 +579,12 @@ generateHaskellModule modName typeMap ddecls bindings =
         initCtx = CompileContext { ctxTypeMap = typeMap, ctxEnv = [] }
 
         generatedDecls = concatMap (map prettyHsDecl . compileBinding initCtx) bindings
-        compiledDDecls = map compileDDecl ddecls
+        compiledDDecls = map (prettyHsDecl . compileDDecl) ddecls
+
         showableBindings = filter (\(_, ty, _) -> isShowableTy ty) bindings
 
         haskellCode = unlines $
-              ["{-# LANGUAGE BangPatterns #-}"
-              ,"module " ++ capitalize modName ++ " where"
+              ["module " ++ capitalize modName ++ " where"
               , ""
               , "import Prelude hiding (fst, snd, (.))"
               ] ++ compiledDDecls ++
