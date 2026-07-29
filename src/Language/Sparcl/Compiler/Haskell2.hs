@@ -267,7 +267,7 @@ compileExpr ctx expr = case expr of
     Core.RCon c es      -> compileRCon ctx c es
     Core.Case e alts    -> compileCase ctx e alts
     Core.Let binds body -> compileLet ctx binds body
-    Core.RPin e1 e2     -> ForwardOnly (HError "Not implemented")
+    Core.RPin e1 e2     -> compileRPin ctx e1 e2
     Core.RCase e rAlts  -> ForwardOnly (HError "Not implemented")
 
 -- -----------------------------------------------------------------------------------------
@@ -442,6 +442,27 @@ compileLet ctx binds body =
 
         Reversible (RevExpr expr) ->
             Reversible (RevExpr (HLet hsBinds expr))
+
+compileRPin :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
+compileRPin ctx e1 e2 =
+    let res1 = compileExpr ctx e1
+        fwd_e2 = getFwd (compileExpr ctx e2)
+    in case res1 of
+        ForwardOnly _ ->
+            ForwardOnly (HError "Compiler Bug: RPin applied to non-reversible expression")
+        Reversible r -> Reversible $ RevExpr $
+            withRev "_pin" r $ \fwd_e1 bwd_e1 ->
+                let -- Forward pass ignores the predicate
+                    fwdNode = fwd_e1
+
+                    -- Backward pass applies the predicate.
+                    -- If True, it continues evaluating backwards. If False, it fails.
+                    bwdNode = HLam [HPVar "_out"] $
+                        HIf (HApp fwd_e2 (HVar "_out"))
+                            (HApp bwd_e1 (HVar "_out"))
+                            (HError "Pin predicate failed: Branch mismatch in backward pass")
+
+                in unRevExpr (mkRev fwdNode bwdNode)
 
 -- | Function to compile data declarations
 compileDDecl :: Core.DDecl Name.Name -> String
