@@ -208,6 +208,15 @@ patToExp (Core.PCon c ps) =
        then HTuple (map patToExp ps)
        else foldl HApp (HCon (translateConName rawCName)) (map patToExp ps)
 
+-- | A safe pattern reconstructor that uses the un-shadowed "_res" variables!
+patToExpRes :: Core.Pat Name.Name -> HsExpr
+patToExpRes (Core.PVar n) = HVar (formatName (prettyShow n) ++ "_res")
+patToExpRes (Core.PCon c ps) =
+    let rawCName = prettyShow c
+    in if isTupleName rawCName
+       then HTuple (map patToExpRes ps)
+       else foldl HApp (HCon (translateConName rawCName)) (map patToExpRes ps)
+
 -- | Helper function to format names to valid Haskell
 formatName :: String -> String
 formatName s
@@ -429,26 +438,34 @@ findVars (Core.Abs _ body) vs = findVars body vs
 findVars (Core.Unlift e) vs = findVars e vs
 findVars _ _ = []
 
--- | Helper function to dynamically derive a pattern from the RHS expression
+-- | Dynamically derive the pattern, appending "_res" to avoid shadowing original functions!
 deriveBwdPat :: Core.Exp Name.Name -> [Name.Name] -> HsPat
 deriveBwdPat (Core.RCase _ _) vs =
     case length vs of
         0 -> HPTuple []
-        1 -> HPVar (formatName (prettyShow (head vs)))
-        _ -> HPTuple (map (HPVar . formatName . prettyShow) vs)
+        1 -> HPVar (formatName (prettyShow (head vs)) ++ "_res")
+        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
 deriveBwdPat (Core.RPin _ _) vs =
     case length vs of
         0 -> HPTuple []
-        1 -> HPVar (formatName (prettyShow (head vs)))
-        _ -> HPTuple (map (HPVar . formatName . prettyShow) vs)
-deriveBwdPat (Core.RCon c args) vs = HPCon (translateConName (prettyShow c)) (map (`deriveBwdPat` vs) args)
-deriveBwdPat (Core.Con c args) vs = HPCon (translateConName (prettyShow c)) (map (`deriveBwdPat` vs) args)
+        1 -> HPVar (formatName (prettyShow (head vs)) ++ "_res")
+        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
+deriveBwdPat (Core.RCon c args) vs =
+    let cName = prettyShow c
+    in if isTupleName cName
+       then HPTuple (map (`deriveBwdPat` vs) args)
+       else HPCon (translateConName cName) (map (`deriveBwdPat` vs) args)
+deriveBwdPat (Core.Con c args) vs =
+    let cName = prettyShow c
+    in if isTupleName cName
+       then HPTuple (map (`deriveBwdPat` vs) args)
+       else HPCon (translateConName cName) (map (`deriveBwdPat` vs) args)
 deriveBwdPat e vs =
-    let found = findVars e vs
+    let found = intersect (findVars e vs) vs
     in case length found of
         0 -> HPWild
-        1 -> HPVar (formatName (prettyShow (head found)))
-        _ -> HPTuple (map (HPVar . formatName . prettyShow) found)
+        1 -> HPVar (formatName (prettyShow (head found)) ++ "_res")
+        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) found)
 
 compileRCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileRCase ctx e alts =
@@ -466,6 +483,7 @@ compileRCase ctx e alts =
                         rBody = case resBody of
                                     Reversible r -> r
                                     ForwardOnly expr -> RevExpr expr
+                    -- The forward case only returns the forward value.
                     in (compilePat pat, withRev "_alt" rBody const)
 
                 fwdNode = HCase fwdE (map compileFwdAlt alts)
@@ -478,17 +496,27 @@ compileRCase ctx e alts =
                                     Reversible r -> r
                                     ForwardOnly expr -> RevExpr expr
 
-                        -- THE FIX: Mutually recursive let-bindings to tie the knot!
-                        -- By grouping these in a single HLet, the forward body and the
-                        -- extracted backward variables safely share the same scope.
+                        allLinVars = nub [ v | Variable v kind <- ctxEnv altCtx
+                                             , kind `elem` [LinearArg, LinearPat] || prettyShow v == "k" ]
+                        bVars = patVars pat
+                        fVars = intersect (findVars body allLinVars) allLinVars \\ bVars
+                        vars = bVars ++ fVars
+
+                        rhsPat = deriveBwdPat body vars
+                        rBodyExpr = unRevExpr rBody
+
+                        bwdScrutinee = HApp bwdE (patToExpRes pat)
+
+                        retExpr = if null fVars
+                                  then bwdScrutinee
+                                  else HTuple (bwdScrutinee : map (\v -> HVar (formatName (prettyShow v) ++ "_res")) fVars)
+
+                        -- This prevents Type Clashes across branches and solves variable scoping.
                         branchExec =
-                            let vars = patVars pat
-                                rhsPat = deriveBwdPat body vars
-                                rBodyExpr = unRevExpr rBody
-                            in HLet [ (HPTuple [HPVar "_body_fwd", HPVar "_body_bwd"], rBodyExpr)
-                                    , (rhsPat, HApp (HVar "_body_bwd") (HVar "_out"))
-                                    ]
-                                    (HApp bwdE (patToExp pat))
+                            HLet [ (compilePat pat, fwdE) ] $
+                                HLet [ (HPTuple [HPVar "_body_fwd", HPVar "_body_bwd"], rBodyExpr) ] $
+                                    HLet [ (rhsPat, HApp (HVar "_body_bwd") (HVar "_out")) ]
+                                        retExpr
 
                         condCheck = HApp (getRawExpr (compileExpr ctx cond)) (HVar "_out")
 
