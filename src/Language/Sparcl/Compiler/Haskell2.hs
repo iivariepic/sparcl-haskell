@@ -408,6 +408,48 @@ compileRPin ctx e1 e2 =
                         (HError "Pin predicate failed: Branch mismatch in backward pass")
             in unRevExpr (mkRev fwdNode bwdNode)
 
+-- | Helper function to locate ALL specific linear variables within the AST
+findVars :: Core.Exp Name.Name -> [Name.Name] -> [Name.Name]
+findVars (Core.Var v) vs | v `elem` vs = [v]
+findVars (Core.App e1 e2) vs = findVars e1 vs `union` findVars e2 vs
+findVars (Core.Con _ args) vs = nub (concatMap (`findVars` vs) args)
+findVars (Core.RCon _ args) vs = nub (concatMap (`findVars` vs) args)
+findVars (Core.Lift e1 e2) vs = findVars e1 vs `union` findVars e2 vs
+findVars (Core.Let binds body) vs =
+    let bindVars = concatMap (\(_, _, e) -> findVars e vs) binds
+    in nub (bindVars ++ findVars body vs)
+findVars (Core.Case e alts) vs =
+    let altVars = concatMap (\(_, body) -> findVars body vs) alts
+    in nub (findVars e vs ++ altVars)
+findVars (Core.RCase e alts) vs =
+    let altVars = concatMap (\(_, body, _) -> findVars body vs) alts
+    in nub (findVars e vs ++ altVars)
+findVars (Core.RPin e1 e2) vs = findVars e1 vs `union` findVars e2 vs
+findVars (Core.Abs _ body) vs = findVars body vs
+findVars (Core.Unlift e) vs = findVars e vs
+findVars _ _ = []
+
+-- | Helper function to dynamically derive a pattern from the RHS expression
+deriveBwdPat :: Core.Exp Name.Name -> [Name.Name] -> HsPat
+deriveBwdPat (Core.RCase _ _) vs =
+    case length vs of
+        0 -> HPTuple []
+        1 -> HPVar (formatName (prettyShow (head vs)))
+        _ -> HPTuple (map (HPVar . formatName . prettyShow) vs)
+deriveBwdPat (Core.RPin _ _) vs =
+    case length vs of
+        0 -> HPTuple []
+        1 -> HPVar (formatName (prettyShow (head vs)))
+        _ -> HPTuple (map (HPVar . formatName . prettyShow) vs)
+deriveBwdPat (Core.RCon c args) vs = HPCon (translateConName (prettyShow c)) (map (`deriveBwdPat` vs) args)
+deriveBwdPat (Core.Con c args) vs = HPCon (translateConName (prettyShow c)) (map (`deriveBwdPat` vs) args)
+deriveBwdPat e vs =
+    let found = findVars e vs
+    in case length found of
+        0 -> HPWild
+        1 -> HPVar (formatName (prettyShow (head found)))
+        _ -> HPTuple (map (HPVar . formatName . prettyShow) found)
+
 compileRCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name, Core.Exp Name.Name)] -> CompileResult
 compileRCase ctx e alts =
     let resE = compileExpr ctx e
@@ -417,8 +459,6 @@ compileRCase ctx e alts =
     in Reversible $ RevExpr $
         withRev "_rcase" rE $ \fwdE bwdE ->
 
-            -- FIX: Coerce the body to a RevExpr (just like we do in the backward pass)
-            -- and safely extract ONLY the forward value using withRev.
             let compileFwdAlt (pat, body, _cond) =
                     let boundVars = map (`Variable` LinearPat) (patVars pat)
                         altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
@@ -426,7 +466,7 @@ compileRCase ctx e alts =
                         rBody = case resBody of
                                     Reversible r -> r
                                     ForwardOnly expr -> RevExpr expr
-                    in (compilePat pat, withRev "_alt" rBody (\fwd _bwd -> fwd))
+                    in (compilePat pat, withRev "_alt" rBody const)
 
                 fwdNode = HCase fwdE (map compileFwdAlt alts)
 
@@ -438,19 +478,21 @@ compileRCase ctx e alts =
                                     Reversible r -> r
                                     ForwardOnly expr -> RevExpr expr
 
-                        -- Reconstruct the pattern for bwdE, strictly evaluating bwdBody
-                        branchExec = withRev "_body" rBody $ \_fwdBody bwdBody ->
-                            let patExpr = patToExp pat
-                            in HLet [ (HPBang HPWild, HApp bwdBody (HVar "_out")) ]
-                                    (HApp bwdE patExpr)
+                        -- THE FIX: Mutually recursive let-bindings to tie the knot!
+                        -- By grouping these in a single HLet, the forward body and the
+                        -- extracted backward variables safely share the same scope.
+                        branchExec =
+                            let vars = patVars pat
+                                rhsPat = deriveBwdPat body vars
+                                rBodyExpr = unRevExpr rBody
+                            in HLet [ (HPTuple [HPVar "_body_fwd", HPVar "_body_bwd"], rBodyExpr)
+                                    , (rhsPat, HApp (HVar "_body_bwd") (HVar "_out"))
+                                    ]
+                                    (HApp bwdE (patToExp pat))
 
                         condCheck = HApp (getRawExpr (compileExpr ctx cond)) (HVar "_out")
 
-                        -- Mask out of scope linear variables using an un-evaluated HLet block
-                        dummyBinds = [ (HPVar (formatName (prettyShow v)), HError "Unreachable forward pass var") | v <- patVars pat ]
-                        execWithDummies = if null dummyBinds then branchExec else HLet dummyBinds branchExec
-
-                    in HIf condCheck execWithDummies (buildBwd rest)
+                    in HIf condCheck branchExec (buildBwd rest)
 
                 bwdNode = HLam [HPVar "_out"] (buildBwd alts)
 
