@@ -8,6 +8,7 @@ import           Data.List
 import           Data.Maybe
 import           Data.Char (toUpper)
 import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@), PolyTy)
+import           Language.Sparcl.Compiler.PreludeExports (preludeExports)
 
 -- | Target Haskell Patterns
 data HsPat
@@ -35,7 +36,7 @@ data HsExpr
 -- | Top-level Declarations
 data HsDecl
     = HBind String HsExpr
-    | HData String [String] [(String, [String])]
+    | HData String [String] [(String, [String])] Bool
     deriving (Eq, Show)
 
 -- | Strip the module prefix for checking operator/tuple names
@@ -94,10 +95,11 @@ prettyHsExpr p expr = case expr of
 prettyHsDecl :: HsDecl -> String
 prettyHsDecl decl = case decl of
     HBind name e -> name ++ " = " ++ prettyHsExpr 0 e
-    HData dName tyVars cons ->
+    HData dName tyVars cons isShowable ->
         let lhs = unwords (dName : tyVars)
             rhs = intercalate " | " [ unwords (c : args) | (c, args) <- cons ]
-        in "data " ++ lhs ++ " = " ++ rhs ++ " deriving Show"
+            derivingClause = if isShowable then " deriving Show" else ""
+        in "data " ++ lhs ++ " = " ++ rhs ++ derivingClause
 
 data Variable = Variable
     { varName :: Name.Name
@@ -513,6 +515,16 @@ compileRCase ctx e alts =
 
             in unRevExpr (mkRev fwdNode bwdNode)
 
+-- | Helper function to check if a type is showable within a data declaration
+isShowableDataTy :: Ty -> Bool
+isShowableDataTy ty = case ty of
+    _ | isFunctionTy ty           -> False
+    TyVar _                       -> True
+    TyForAll _ (TyQual _ innerTy) -> isShowableDataTy innerTy
+    TySyn _ innerTy               -> isShowableDataTy innerTy
+    TyCon _ args                  -> all isShowableDataTy args
+    _                             -> True
+
 -- | Function to compile data declarations into the target AST
 compileDDecl :: Core.DDecl Name.Name -> HsDecl
 compileDDecl (Core.DDecl dataName tyVars constructors) =
@@ -527,11 +539,14 @@ compileDDecl (Core.DDecl dataName tyVars constructors) =
                     in if ' ' `elem` typeStr && not ("(" `isPrefixOf` typeStr)
                         then "(" ++ typeStr ++ ")"
                         else typeStr
-            in (cNameStr, map formatArg argTypes)
+            in ((cNameStr, map formatArg argTypes), all isShowableDataTy argTypes)
 
-        consDecls = map compileCons constructors
+        compiledCons = map compileCons constructors
+        consDecls = map fst compiledCons
+
+        isDataShowable = all snd compiledCons
     in
-        HData dNameStr tyVarStrs consDecls
+        HData dNameStr tyVarStrs consDecls isDataShowable
 
 -- | Helper function to capitalize first character of a string
 capitalize :: String -> String
@@ -559,6 +574,7 @@ isShowableTy ty = case ty of
 constructPutStrLn :: (Name.Name, Ty, Core.Exp Name.Name) -> String
 constructPutStrLn (name, _, _) = "\"\\n" ++ prettyShow name ++ ": \" ++ show " ++ formatName (prettyShow name)
 
+-- | Function to generate the raw string of the entire Haskell module
 generateHaskellModule :: String -> [(Name.Name, PolyTy)] -> [Core.DDecl Name.Name] -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
 generateHaskellModule modName typeMap ddecls bindings =
     let
@@ -573,10 +589,23 @@ generateHaskellModule modName typeMap ddecls bindings =
                    then "\"\""
                    else intercalate " ++ " (map constructPutStrLn showableBindings)
 
+        -- Dynamically hide any Prelude functions that were defined in the Sparcl code
+        bindingNames = map (\(n, _, _) -> formatName (prettyShow n)) bindings
+        dataNames = concatMap (\(Core.DDecl dName _ cons) ->
+                                  formatName (prettyShow dName) :
+                                  map (\(cName, _, _, _) -> translateConName (prettyShow cName)) cons
+                              ) ddecls
+        definedNames = bindingNames ++ dataNames
+        hidingList   = nub $ filter (`elem` preludeExports) definedNames
+
+        importDecl = if null hidingList
+                     then "import Prelude"
+                     else "import Prelude hiding (" ++ intercalate ", " hidingList ++ ")"
+
         haskellCode = unlines $
               ["module " ++ capitalize modName ++ " where"
               , ""
-              , "import Prelude hiding (fst, snd, (.))"
+              , importDecl
               ] ++ compiledDDecls ++
               [ ""
               , "main :: IO ()"
