@@ -268,7 +268,7 @@ compileExpr ctx expr = case expr of
     Core.Case e alts    -> compileCase ctx e alts
     Core.Let binds body -> compileLet ctx binds body
     Core.RPin e1 e2     -> compileRPin ctx e1 e2
-    Core.RCase e rAlts  -> ForwardOnly (HError "Not implemented")
+    Core.RCase e rAlts  -> compileRCase ctx e rAlts
 
 -- -----------------------------------------------------------------------------------------
 -- Compiling Specific Expression Node Types
@@ -461,6 +461,45 @@ compileRPin ctx e1 e2 =
                         HIf (HApp fwd_e2 (HVar "_out"))
                             (HApp bwd_e1 (HVar "_out"))
                             (HError "Pin predicate failed: Branch mismatch in backward pass")
+
+                in unRevExpr (mkRev fwdNode bwdNode)
+
+compileRCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name, Core.Exp Name.Name)] -> CompileResult
+compileRCase ctx e alts =
+    let resE = compileExpr ctx e
+    in case resE of
+        ForwardOnly _ ->
+            ForwardOnly (HError "Compiler Bug: RCase applied to non-reversible expression")
+        Reversible rE -> Reversible $ RevExpr $
+            withRev "_rcase" rE $ \fwdE bwdE ->
+
+                -- 1. Forward pass: A standard HCase (we ignore the backward condition)
+                -- Note: Assuming the AST tuple is (Pattern, Body, Condition).
+                -- If it's (Pattern, Condition, Body), simply swap `body` and `_cond` here.
+                let compileFwdAlt (pat, body, _cond) =
+                        -- The bound variables are Linear!
+                        let boundVars = map (`Variable` Linear) (patVars pat)
+                            altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                            resBody = compileExpr altCtx body
+                        in (compilePat pat, getFwd resBody)
+
+                    fwdNode = HCase fwdE (map compileFwdAlt alts)
+
+                    -- 2. Backward pass
+                    bwdNode = case alts of
+                        -- If it is a `let rev p <- e1 in e2` binding, there is exactly one alternative.
+                        [(pat, body, _cond)] ->
+                            let boundVars = map (`Variable` Linear) (patVars pat)
+                                altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                                resBody = getReversible (compileExpr altCtx body)
+
+                            -- We compose the backward closures: bwdE (bwdBody out)
+                            in withRev "_body" resBody $ \_fwdBody bwdBody ->
+                                HLam [HPVar "_out"] (HApp bwdE (HApp bwdBody (HVar "_out")))
+
+                        -- True multi-branch RCase backward routing requires inverse patterns,
+                        -- which is beyond a simple AST translation pass.
+                        _ -> HError "RCase with multiple branches not implemented for backward pass"
 
                 in unRevExpr (mkRev fwdNode bwdNode)
 
