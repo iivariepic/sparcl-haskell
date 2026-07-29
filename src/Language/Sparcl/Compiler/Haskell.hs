@@ -9,78 +9,173 @@ import           Data.Maybe
 import           Data.Char (toUpper)
 import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@), PolyTy)
 
--- Data type that defines the nature of a bound variable in the current scope
-data BindingKind
-    = PureCopyable       -- ^ Belongs to \Gamma (can be duplicated/dropped freely)
-    | LinearReversible   -- ^ Belongs to \Theta (must be treated as a (fwd, bwd) pair at runtime)
-    | Continuation       -- ^ Bound directly to a backward continuation (no tuple projection needed)
+-- | Target Haskell Patterns
+data HsPat
+    = HPVar String
+    | HPCon String [HsPat]
+    | HPOp String HsPat HsPat
+    | HPTuple [HsPat]
+    | HPWild
+    | HPBang HsPat
     deriving (Eq, Show)
 
--- Data type that tells us if we are inside a reversible binding
-data ContextMode = Inside | Outside deriving (Eq, Show)
+-- | Target Haskell Expressions
+data HsExpr
+    = HVar String
+    | HCon String
+    | HLit String
+    | HApp HsExpr HsExpr
+    | HOp String HsExpr HsExpr
+    | HLam [HsPat] HsExpr
+    | HLet [(HsPat, HsExpr)] HsExpr
+    | HCase HsExpr [(HsPat, HsExpr)]
+    | HTuple [HsExpr]
+    | HIf HsExpr HsExpr HsExpr
+    | HError String
+    deriving (Eq, Show)
 
--- Data type for the context of the compiler
-data CompilerContext =  CompilerContext
-    { ctxTypeMap  :: [(Name.Name, PolyTy)]
-    , ctxEnv :: [(Name.Name, BindingKind)]
-    , ctxMode :: ContextMode
+-- | Top-level Declarations
+data HsDecl
+    = HBind String HsExpr
+    | HData String [String] [(String, [String])]
+    deriving (Eq, Show)
+
+-- | Strip the module prefix for checking operator/tuple names
+stripBase :: String -> String
+stripBase s | "Base." `isPrefixOf` s = drop 5 s
+            | otherwise              = s
+
+-- | Check if a string represents an operator
+isOperatorName :: String -> Bool
+isOperatorName s =
+    let s' = stripBase s
+    in not (null s') && all (`elem` "!#$%&*+./<=>?@\\^|-~:") s'
+
+-- | Check if a string represents a tuple constructor
+isTupleName :: String -> Bool
+isTupleName name =
+    let name' = stripBase name
+    in "<Tup " `isPrefixOf` name' ||
+       case stripPrefix "(" name' of
+         Just rest ->
+           case unsnoc rest of
+             Just (middle, ')') -> all (== ',') middle
+             _                  -> False
+         _ -> False
+
+-- | Helper for precedence-based parenthesization
+parensIf :: Bool -> String -> String
+parensIf True  s = "(" ++ s ++ ")"
+parensIf False s = s
+
+-- | Pretty print target patterns
+prettyHsPat :: HsPat -> String
+prettyHsPat pat = case pat of
+    HPVar v       -> v
+    HPCon c []    -> c
+    HPCon c ps    -> "(" ++ c ++ " " ++ unwords (map prettyHsPat ps) ++ ")"
+    HPOp op p1 p2 -> "(" ++ prettyHsPat p1 ++ " " ++ op ++ " " ++ prettyHsPat p2 ++ ")"
+    HPTuple ps    -> "(" ++ intercalate ", " (map prettyHsPat ps) ++ ")"
+    HPWild        -> "_"
+    HPBang p      -> "!" ++ prettyHsPat p
+
+-- | Pretty print target expressions
+prettyHsExpr :: Int -> HsExpr -> String
+prettyHsExpr p expr = case expr of
+    HVar v        -> v
+    HCon c        -> c
+    HLit l        -> l
+    HApp e1 e2    -> parensIf (p > 10) $ prettyHsExpr 10 e1 ++ " " ++ prettyHsExpr 11 e2
+    HOp op e1 e2  -> parensIf (p > 5)  $ prettyHsExpr 5 e1 ++ " " ++ op ++ " " ++ prettyHsExpr 6 e2
+    HLam ps e     -> parensIf (p > 0)  $ "\\" ++ unwords (map prettyHsPat ps) ++ " -> " ++ prettyHsExpr 0 e
+    HLet binds e  -> parensIf (p > 0)  $ "let { " ++ intercalate "; " [ prettyHsPat pat ++ " = " ++ prettyHsExpr 0 b | (pat, b) <- binds ] ++ " } in " ++ prettyHsExpr 0 e
+    HCase e alts  -> parensIf (p > 0)  $ "case " ++ prettyHsExpr 0 e ++ " of {\n" ++ intercalate ";\n" [ "  " ++ prettyHsPat pat ++ " -> " ++ prettyHsExpr 0 body | (pat, body) <- alts ] ++ "\n}"
+    HTuple es     -> "(" ++ intercalate ", " (map (prettyHsExpr 0) es) ++ ")"
+    HIf c t f     -> parensIf (p > 0)  $ "if " ++ prettyHsExpr 0 c ++ " then " ++ prettyHsExpr 0 t ++ " else " ++ prettyHsExpr 0 f
+    HError msg    -> parensIf (p > 10) $ "error " ++ show msg
+
+-- | Pretty print target top-level declarations
+prettyHsDecl :: HsDecl -> String
+prettyHsDecl decl = case decl of
+    HBind name e -> name ++ " = " ++ prettyHsExpr 0 e
+    HData dName tyVars cons ->
+        let lhs = unwords (dName : tyVars)
+            rhs = intercalate " | " [ unwords (c : args) | (c, args) <- cons ]
+        in "data " ++ lhs ++ " = " ++ rhs ++ " deriving Show"
+
+data Variable = Variable
+    { varName :: Name.Name
+    , varKind :: BindingKind
+    } deriving (Eq, Show)
+
+type Env = [Variable]
+
+-- | Unified context for the AST-based compiler
+data CompileContext = CompileContext
+    { ctxTypeMap :: [(Name.Name, PolyTy)]
+    , ctxEnv     :: Env
     }
 
--- Helper to extract all bound variables from a pattern
-patVars :: Core.Pat Name.Name -> [Name.Name]
-patVars pat = case pat of
-    Core.PVar n      -> [n]
-    Core.PCon _ args -> concatMap patVars args
+-- | Data type that defines the nature of a bound variable in the current scope
+data BindingKind
+    = Copy        -- ^ Belongs to \Gamma (can be duplicated/dropped freely)
+    | LinearArg   -- ^ A full reversible tuple passed as an argument
+    | LinearPat   -- ^ A reversible variable bound inside a forward pattern match
+    deriving (Eq, Show)
 
--- Helper function to format names to valid Haskell
-formatName :: String -> String
-formatName s
-    | "Base." `isPrefixOf` s = formatName (drop 5 s)
-    | not (null s) && all (`elem` "!#$%&*+./<=>?@\\^|-~:") s = "(" ++ s ++ ")"
-    | otherwise = s
+-- | Helper to safely extract the underlying Haskell AST node
+getRawExpr :: CompileResult -> HsExpr
+getRawExpr (ForwardOnly expr) = expr
+getRawExpr (Reversible (RevExpr expr)) = expr
 
--- Helper function to translate internal constructor names
-translateConName :: String -> String
-translateConName name
-    | "Base." `isPrefixOf` name = translateConName (drop 5 name)
-    | Just rest <- stripPrefix "<Tup " name =
-        let n = read (init rest) :: Int
-        in "(" ++ replicate (n - 1) ',' ++ ")"
-    | otherwise = name
+-- =========================================================================
+-- REVERSIBLE ABSTRACTIONS
+-- =========================================================================
 
-needsProjection :: CompilerContext -> Core.Exp Name.Name -> Bool
-needsProjection ctx (Core.Var n) =
-    ctxMode ctx /= Outside && (case lookup n (ctxEnv ctx) of
-        Just LinearReversible -> True
-        Just Continuation -> False
-        Just PureCopyable -> False
-        Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx)))
-needsProjection _ (Core.App _ _) = False
-needsProjection _ _ = False
+-- | INVARIANT: A RevExpr is an opaque HsExpr that, at runtime, evaluates to
+--   exactly a 2-tuple: `(forward_pass_value, backward_pass_closure)`.
+newtype RevExpr = RevExpr { unRevExpr :: HsExpr }
+    deriving (Eq, Show)
 
--- Helper to project the forward part of a reversible pair
-projectFwd :: CompilerContext -> Core.Exp Name.Name -> String -> String
-projectFwd ctx (Core.Var n) code =
-    case lookup n (ctxEnv ctx) of
-        Just LinearReversible -> "(let (_f, _) = " ++ code ++ " in _f)"
-        _ -> code ++ "_fwd"
-projectFwd _ _ code = code
+-- | The Compile Result Representation
+data CompileResult
+    = ForwardOnly HsExpr
+    | Reversible RevExpr
+    deriving (Eq, Show)
 
--- Helper to project the backward part of a reversible pair
-projectBwd :: CompilerContext -> Core.Exp Name.Name -> String -> String
-projectBwd ctx (Core.Var n) code =
-    case lookup n (ctxEnv ctx) of
-        Just LinearReversible -> "(let (_, _b) = " ++ code ++ " in _b)"
-        _ -> code ++ "_bwd"
-projectBwd _ _ code = code
+-- | Construct a RevExpr from a forward and backward expression.
+mkRev :: HsExpr -> HsExpr -> RevExpr
+mkRev fwd bwd = RevExpr (HTuple [fwd, bwd])
 
--- Literals
-compileLiteral :: Literal.Literal -> String
-compileLiteral l = case l of
-    Literal.LitInt i    -> show i
-    _                   -> error "compileLiteral: Unhandled literal type"
+-- | Continuation-passing helper to safely bind the forward and backward
+--   components of a RevExpr, ensuring no raw tuple manipulation is exposed.
+withRev :: String -> RevExpr -> (HsExpr -> HsExpr -> HsExpr) -> HsExpr
+withRev prefix (RevExpr e) mkBody =
+    let fName = prefix ++ "_fwd"
+        bName = prefix ++ "_bwd"
+    in HLet [(HPTuple [HPVar fName, HPVar bName], e)]
+            (mkBody (HVar fName) (HVar bName))
 
--- Helper function to check if binding is reversible structurally
+-- | Unpack a CompileResult if you explicitly need the raw underlying HsExpr.
+revExpr :: CompileResult -> HsExpr
+revExpr (Reversible (RevExpr e)) = e
+revExpr (ForwardOnly _) = error "Compiler Bug: Expected reversible computation, but got forward-only."
+
+-- | Safely extracts the forward value.
+getFwd :: CompileResult -> HsExpr
+getFwd (ForwardOnly e) = e
+getFwd (Reversible r)  = withRev "_fwd_ext" r const
+
+-- | Safely asserts and extracts the RevExpr.
+getReversible :: CompileResult -> RevExpr
+getReversible (Reversible r)  = r
+getReversible (ForwardOnly _) = error "Compiler Bug: Expected reversible computation, but got forward-only."
+
+-- | Helper to look up a variable's binding kind in the environment
+lookupVar :: Name.Name -> Env -> Maybe BindingKind
+lookupVar n env = listToMaybe [ kind | Variable vName kind <- env, vName == n ]
+
+-- | Helper function to check if type is reversible structurally
 isReversible :: Ty -> Bool
 isReversible ty = case ty of
     (_ :-@ _) -> True
@@ -98,356 +193,366 @@ isReversibleSpine ty = case ty of
     TySyn _ innerTy               -> isReversibleSpine innerTy
     _ -> False
 
--- Helper to check if an application chain belongs to a reversible function
-isReversibleAppChain :: CompilerContext -> Core.Exp Name.Name -> Bool
-isReversibleAppChain ctx (Core.Var n) =
-    ctxMode ctx /= Outside && (case lookup n (ctxEnv ctx) of
-        Just LinearReversible -> True
-        Just Continuation -> True
-        _ -> maybe False isReversible (lookup n (ctxTypeMap ctx)))
-isReversibleAppChain ctx (Core.App e1 _) = isReversibleAppChain ctx e1
-isReversibleAppChain ctx (Core.RPin e1 _) = isReversibleAppChain ctx e1
-isReversibleAppChain _ _ = False
+-- | Helper to extract all bound variables from a pattern
+patVars :: Core.Pat Name.Name -> [Name.Name]
+patVars pat = case pat of
+    Core.PVar n      -> [n]
+    Core.PCon _ args -> concatMap patVars args
 
--- Helper to check if an expression is a reversible term (regardless of context mode)
-isReversibleExpr :: CompilerContext -> Core.Exp Name.Name -> Bool
-isReversibleExpr ctx (Core.Var n) = case lookup n (ctxEnv ctx) of
-    Just LinearReversible -> True
-    Just Continuation -> True
-    Just PureCopyable -> False
-    Nothing -> maybe False isReversible (lookup n (ctxTypeMap ctx))
-isReversibleExpr ctx (Core.App e1 _) = isReversibleExpr ctx e1
-isReversibleExpr ctx (Core.RPin e1 _) = isReversibleExpr ctx e1
-isReversibleExpr ctx (Core.Abs _ e) = isReversibleExpr ctx e
-isReversibleExpr _ _ = False
+-- | Helper to turn a pattern back into an expression for backward reconstruction
+patToExp :: Core.Pat Name.Name -> HsExpr
+patToExp (Core.PVar n) = HVar (formatName (prettyShow n))
+patToExp (Core.PCon c ps) =
+    let rawCName = prettyShow c
+    in if isTupleName rawCName
+       then HTuple (map patToExp ps)
+       else foldl HApp (HCon (translateConName rawCName)) (map patToExp ps)
 
--- Top-level Bindings
-compileBinding :: CompilerContext -> (Name.Name, Ty, Core.Exp Name.Name) -> String
-compileBinding ctx (name, ty, expr) =
-  let rawName = prettyShow name
-      nameStr = formatName rawName
+-- | A safe pattern reconstructor that uses the un-shadowed "_res" variables!
+patToExpRes :: Core.Pat Name.Name -> HsExpr
+patToExpRes (Core.PVar n) = HVar (formatName (prettyShow n) ++ "_res")
+patToExpRes (Core.PCon c ps) =
+    let rawCName = prettyShow c
+    in if isTupleName rawCName
+       then HTuple (map patToExpRes ps)
+       else foldl HApp (HCon (translateConName rawCName)) (map patToExpRes ps)
 
-      bKind = if isReversible ty then LinearReversible else PureCopyable
-      bMode = if isReversible ty then Inside else Outside
-      initBodyCtx = ctx { ctxEnv = (name, bKind) : ctxEnv ctx, ctxMode = bMode }
+-- | Helper function to format names to valid Haskell
+formatName :: String -> String
+formatName s
+    | "Base." `isPrefixOf` s = formatName (drop 5 s)
+    | not (null s) && all (`elem` "!#$%&*+./<=>?@\\^|-~:") s = "(" ++ s ++ ")"
+    | otherwise = s
 
-  in if bKind == LinearReversible
-    then
-        let fwdCode = compileForward initBodyCtx expr
-            bwdCode = compileBackward initBodyCtx expr
-        in nameStr ++ " = (" ++ nameStr ++ "_fwd , " ++ nameStr ++ "_bwd)\n\n"
-        ++ nameStr ++ "_fwd = " ++ fwdCode ++ "\n\n" ++ nameStr ++ "_bwd = " ++ bwdCode
-    else
-        let code = compileForward initBodyCtx expr
-        in nameStr ++ " = " ++ code
+-- | Helper function to translate internal constructor names
+translateConName :: String -> String
+translateConName name
+    | "Base." `isPrefixOf` name = translateConName (drop 5 name)
+    | Just rest <- stripPrefix "<Tup " name =
+        let n = read (init rest) :: Int
+        in "(" ++ replicate (n - 1) ',' ++ ")"
+    | otherwise = name
 
--- Patterns
-compilePattern :: Core.Pat Name.Name -> String
-compilePattern pat = case pat of
-    Core.PVar n -> prettyShow n
+-- | Compile a top-level binding into a list of Haskell AST declarations
+compileBinding :: CompileContext -> (Name.Name, Ty, Core.Exp Name.Name) -> [HsDecl]
+compileBinding ctx (name, _, expr) =
+    let nameStr = formatName (prettyShow name)
+        initBodyCtx = ctx { ctxEnv = Variable name Copy : ctxEnv ctx }
+        compiled = compileExpr initBodyCtx expr
+    in [ HBind nameStr (getRawExpr compiled) ]
+
+-- | Translate Sparcl Patterns to Haskell Patterns
+compilePat :: Core.Pat Name.Name -> HsPat
+compilePat pat = case pat of
+    Core.PVar n -> HPVar (formatName (prettyShow n))
     Core.PCon c ps ->
-        let cName = translateConName (prettyShow c)
-            psCode = map compilePattern ps
-        in  if null psCode
-            then cName
-            else "(" ++ cName ++ " " ++ unwords psCode ++ ")"
+        let rawCName = prettyShow c
+            psAst    = map compilePat ps
+        in if isTupleName rawCName
+            then HPTuple psAst
+            else HPCon (translateConName rawCName) psAst
 
--- Compiling unidirectional or forward functions
-compileForward :: CompilerContext -> Core.Exp Name.Name -> String
-compileForward ctx expr = case expr of
-    -- Literal values
-    Core.Lit l -> compileLiteral l
+-- | Helper for literals
+compileLiteral :: Literal.Literal -> HsExpr
+compileLiteral (Literal.LitInt i) = HLit (show i)
+compileLiteral _ = HError "Unhandled literal type"
 
-    -- Variables
-    Core.Var n -> formatName (prettyShow n)
+-- | The expression compilation pass routing to specialized helpers
+compileExpr :: CompileContext -> Core.Exp Name.Name -> CompileResult
+compileExpr ctx expr = case expr of
+    Core.Lit l          -> ForwardOnly (compileLiteral l)
+    Core.Lift e1 e2     -> compileLift ctx e1 e2
+    Core.Unlift e       -> compileUnlift ctx e
+    Core.Var n          -> compileVar ctx n
+    Core.Abs n body     -> compileAbs ctx n body
+    Core.App e1 e2      -> compileApp ctx e1 e2
+    Core.Con c es       -> compileCon ctx c es
+    Core.RCon c es      -> compileRCon ctx c es
+    Core.Case e alts    -> compileCase ctx e alts
+    Core.Let binds body -> compileLet ctx binds body
+    Core.RPin e1 e2     -> compileRPin ctx e1 e2
+    Core.RCase e rAlts  -> compileRCase ctx e rAlts
 
-    -- Lambda abstractions
-    Core.Abs n e ->
-        let varName  = prettyShow n
-            isRevLambda = ctxMode ctx == Outside && isReversibleExpr ctx e
-        in if isRevLambda
-           then
-               let bodyContext = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx, ctxMode = Inside }
-                   fwdCode = compileForward bodyContext e
-                   bwdCode = compileBackward bodyContext e
-               in "( (\\" ++ varName ++ " -> " ++ fwdCode ++ ") , (\\_v -> let " ++ varName ++ " = undefined in (" ++ bwdCode ++ ") _v) )"
-           else
-               let bodyCtx  = ctx { ctxEnv = (n, PureCopyable) : ctxEnv ctx }
-                   bodyCode = compileForward bodyCtx e
-               in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
+-- -----------------------------------------------------------------------------------------
+-- Compiling Specific Expression Node Types
+-- -----------------------------------------------------------------------------------------
 
-    -- Data constructors
-    Core.Con c es ->
-        let cName = translateConName (prettyShow c)
-            args = map (compileForward ctx) es
-        in if null args
-            then cName
-            else "(" ++ cName ++ " " ++ unwords args ++ ")"
+compileLift :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
+compileLift ctx e1 e2 =
+    let fwdEx = getFwd (compileExpr ctx e1)
+        bwdEx = getFwd (compileExpr ctx e2)
+    in ForwardOnly (HTuple [fwdEx, bwdEx])
 
-    Core.RCon c es ->
-        let cName = translateConName (prettyShow c)
-            compileArg e =
-                let code = compileForward ctx e
-                in if needsProjection ctx e
-                   then projectFwd ctx e code
-                   else code
-            args = map compileArg es
-        in if null args then cName else "(" ++ cName ++ " " ++ unwords args ++ ")"
+compileUnlift :: CompileContext -> Core.Exp Name.Name -> CompileResult
+compileUnlift ctx e = case compileExpr ctx e of
+    Reversible (RevExpr r) -> ForwardOnly r
+    ForwardOnly h ->
+        let wrappedAs = HTuple [HVar "_as", HLam [HPVar "_v"] (HVar "_v")]
 
-    -- Let bindings
-    Core.Let binds body ->
-        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward ctx e
-            bindsCode = map compileBind binds
-            bindsString = intercalate "; " bindsCode
+            fwdFun = HLam [HPVar "_as"] $
+                HLet [(HPTuple [HPVar "_fwd_val", HPWild], HApp h wrappedAs)]
+                     (HVar "_fwd_val")
 
-            -- Add local bindings to reversible names
-            newEnvBindings = [ (n, if isReversible ty then LinearReversible else PureCopyable)
-                             | (n, ty, _) <- binds ]
-            bodyCtx = ctx { ctxEnv = newEnvBindings ++ ctxEnv ctx }
+            bwdFun = HLam [HPVar "_out"] $
+                HLet [ (HPVar "_as", HApp (HVar "_bwd_rec") (HVar "_out"))
+                     , (HPTuple [HPWild, HPVar "_bwd_closure"], HApp h wrappedAs)
+                     ]
+                     (HApp (HVar "_bwd_closure") (HVar "_out"))
 
-        in "(let { " ++ bindsString ++ " } in " ++ compileForward bodyCtx body ++ ")"
+        in ForwardOnly $ HLet [(HPVar "_bwd_rec", bwdFun)] (HTuple [fwdFun, HVar "_bwd_rec"])
 
-    -- Case expressions
-    Core.Case e alts ->
-        let scrutinee = compileForward ctx e
-            compileAlt (p, body) =
-                let pVars   = patVars p
-                    bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                in "  " ++ compilePattern p ++ " -> " ++ compileForward bodyCtx body
-            altsCode = map compileAlt alts
-        in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
+compileVar :: CompileContext -> Name.Name -> CompileResult
+compileVar ctx n =
+    let v = formatName (prettyShow n)
+    in case lookupVar n (ctxEnv ctx) of
+        Just LinearArg -> Reversible (RevExpr (HVar v))
+        Just LinearPat -> Reversible (mkRev (HVar v) (HLam [HPVar "_v"] (HVar "_v")))
+        _              -> ForwardOnly (HVar v)
 
-    -- Reversible Case expressions
-    Core.RCase e rAlts ->
-        let scrutCode = compileForward ctx e
-            scrutVal  = if needsProjection ctx e
-                        then projectFwd ctx e scrutCode
-                        else scrutCode
-            compileAlt (p, body, _pin) =
-                let pVars   = patVars p
-                    bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                in "  " ++ compilePattern p ++ " -> " ++ compileForward bodyCtx body
+compileAbs :: CompileContext -> Name.Name -> Core.Exp Name.Name -> CompileResult
+compileAbs ctx n body =
+    let isLin = maybe False isReversible (lookup n (ctxTypeMap ctx))
+        kind  = if isLin then LinearArg else Copy
+        varObj  = Variable n kind
+        bodyCtx = ctx { ctxEnv = varObj : ctxEnv ctx }
+        compiledBody = compileExpr bodyCtx body
+        pat = HPVar (formatName (prettyShow n))
+    in case compiledBody of
+        Reversible r  -> ForwardOnly (HLam [pat] (unRevExpr r))
+        ForwardOnly f -> ForwardOnly (HLam [pat] f)
 
-            altsCode = map compileAlt rAlts
-        in "(case " ++ scrutVal ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
+compileApp :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
+compileApp ctx e1 e2 = case e1 of
+    Core.App (Core.Var op) lhs | isOperatorName (stripBase (prettyShow op)) ->
+        let l = getRawExpr (compileExpr ctx lhs)
+            r = getRawExpr (compileExpr ctx e2)
+        in ForwardOnly (HOp (stripBase (prettyShow op)) l r)
+    _ ->
+        let f1 = getRawExpr (compileExpr ctx e1)
+            f2 = getRawExpr (compileExpr ctx e2)
+        in ForwardOnly (HApp f1 f2)
 
-    -- RPin
-    Core.RPin e1 e2 ->
-        let f1Code = compileForward ctx e1
-            hCode  = compileForward ctx e2
-        in "(let _a = " ++ f1Code ++ " in let _f2 = (" ++ hCode ++ " _a) in (_a, _f2))"
+compileCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
+compileCon ctx c es =
+    let compiledArgs = map (getFwd . compileExpr ctx) es
+        rawCName     = prettyShow c
+    in ForwardOnly $
+        if isTupleName rawCName
+            then HTuple compiledArgs
+            else foldl HApp (HCon (translateConName rawCName)) compiledArgs
 
-    -- Lift
-    Core.Lift e1 e2 ->
-        let fwdCode = compileForward ctx e1
-            bwdCode = compileBackward ctx e2
-        in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
+compileRCon :: CompileContext -> Name.Name -> [Core.Exp Name.Name] -> CompileResult
+compileRCon ctx c es =
+    let compiledArgs = map (compileExpr ctx) es
+        rawCName = prettyShow c
+        cName    = translateConName rawCName
 
-    -- Unlift
-    Core.Unlift e -> compileForward ctx e
+        buildArgs :: Int -> [CompileResult] -> ([HsExpr] -> [HsExpr] -> HsExpr) -> HsExpr
+        buildArgs _ [] k = k [] []
+        buildArgs i (res:rest) k =
+            let r = case res of
+                        Reversible rev -> rev
+                        ForwardOnly expr -> RevExpr expr
+            in withRev ("_a" ++ show i) r $ \fwd bwd ->
+                buildArgs (i+1) rest $ \fs bs -> k (fwd:fs) (bwd:bs)
 
-    -- Recursive compilation of the entire function App
-    Core.App e1 e2 ->
-        let code1 = compileForward ctx e1
-            code2 = compileForward ctx e2
-        in if needsProjection ctx e1
-            then "(" ++ projectFwd ctx e1 code1 ++ " " ++ code2 ++ ")"
-            else "(" ++ code1 ++ " " ++ code2 ++ ")"
+    in Reversible $ RevExpr $
+        buildArgs 1 compiledArgs $ \fwdArgs bwdArgs ->
+            let fwdNode = if isTupleName rawCName
+                          then HTuple fwdArgs
+                          else foldl HApp (HCon cName) fwdArgs
 
--- Compiling backward functions
-compileBackward :: CompilerContext -> Core.Exp Name.Name -> String
-compileBackward ctx expr = case expr of
+                argNames = [ "_val" ++ show i | i <- [1..length es] ]
+                argPats  = map HPVar argNames
+                pat = if isTupleName rawCName then HPTuple argPats else HPCon cName argPats
 
-    -- Variables in backward evaluation
-    Core.Var n ->
-        case lookup n (ctxEnv ctx) of
-            Just PureCopyable -> "(\\_v -> _v)"
-            Just LinearReversible -> formatName (prettyShow n)
-            Just Continuation -> formatName (prettyShow n)
-            Nothing ->
-                if needsProjection ctx expr then
-                    formatName (prettyShow n)
-                else
-                    "(\\_v -> _v)"
+                reconArgs = zipWith (\bwd argName -> HApp bwd (HVar argName)) bwdArgs argNames
+                reconBody = if isTupleName rawCName
+                            then HTuple reconArgs
+                            else foldl HApp (HCon cName) reconArgs
 
-    -- Lambda abstractions
-    Core.Abs n e ->
-        let varName  = prettyShow n
-            bKind    = Data.Maybe.fromMaybe PureCopyable (lookup n (ctxEnv ctx))
-            bodyCtx  = ctx { ctxEnv = (n, bKind) : ctxEnv ctx }
-            bodyCode = compileBackward bodyCtx e
-        in "(\\" ++ varName ++ " -> " ++ bodyCode ++ ")"
+                bwdClosure = HLam [HPVar "_val"] (HCase (HVar "_val") [(pat, reconBody)])
 
-    -- Data constructors
-    Core.RCon c es ->
-            let cName = translateConName (prettyShow c)
-                vars  = [ "_v" ++ show i | i <- [1..length es] ]
-                pat   = if null vars then cName else "(" ++ cName ++ " " ++ unwords vars ++ ")"
+            in unRevExpr (mkRev fwdNode bwdClosure)
 
-                compileArg e v =
-                    let code = compileBackward ctx e
-                    in if needsProjection ctx e
-                       then "(" ++ projectBwd ctx e code ++ " " ++ v ++ ")"
-                       else "(" ++ code ++ " " ++ v ++ ")"
+compileCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name)] -> CompileResult
+compileCase ctx e alts =
+    let compiledScrut = getRawExpr (compileExpr ctx e)
+        compileAlt (pat, body) =
+            let boundVars = map (`Variable` Copy) (patVars pat)
+                altCtx    = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                bodyRes   = compileExpr altCtx body
+            in ((compilePat pat, getRawExpr bodyRes), bodyRes)
+        compiledAlts = map compileAlt alts
+        hsAlts = map fst compiledAlts
+    in case snd (head compiledAlts) of
+         Reversible _ -> Reversible $ RevExpr $ HCase compiledScrut hsAlts
+         ForwardOnly _ -> ForwardOnly $ HCase compiledScrut hsAlts
 
-                results = zipWith compileArg es vars
-                body = case results of
-                    []  -> "()"
-                    [r] -> r
-                    _   -> "(" ++ intercalate ", " results ++ ")"
-            in "(\\_v -> case _v of { " ++ pat ++ " -> " ++ body ++ "; _ -> error \"Backward RCon mismatch: expected " ++ cName ++ "\" })"
+compileLet :: CompileContext -> Core.Bind Name.Name -> Core.Exp Name.Name -> CompileResult
+compileLet ctx binds body =
+    let mkVar (n, ty, _) = Variable n (if isReversible ty then LinearArg else Copy)
+        newVars = map mkVar binds
+        bodyCtx = ctx { ctxEnv = newVars ++ ctxEnv ctx }
+        compileBind (n, _ty, e) = (HPVar (formatName (prettyShow n)), getRawExpr (compileExpr bodyCtx e))
+        hsBinds = map compileBind binds
+        compiledBody = compileExpr bodyCtx body
+    in case compiledBody of
+        ForwardOnly expr -> ForwardOnly (HLet hsBinds expr)
+        Reversible (RevExpr expr) -> Reversible (RevExpr (HLet hsBinds expr))
 
-    -- Let bindings
-    Core.Let binds body ->
-        let compileBind (n, _ty, e) = prettyShow n ++ " = " ++ compileForward ctx e
-            bindsCode = map compileBind binds
-            bindsString = intercalate "; " bindsCode
+compileRPin :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> CompileResult
+compileRPin ctx e1 e2 =
+    let res1 = compileExpr ctx e1
+        fwd_e2 = getFwd (compileExpr ctx e2)
+        r1 = case res1 of
+                Reversible r -> r
+                ForwardOnly expr -> RevExpr expr
+    in Reversible $ RevExpr $
+        withRev "_pin" r1 $ \fwd_e1 bwd_e1 ->
+            let fwdNode = fwd_e1
+                bwdNode = HLam [HPVar "_out"] $
+                    HIf (HApp fwd_e2 (HVar "_out"))
+                        (HApp bwd_e1 (HVar "_out"))
+                        (HError "Pin predicate failed: Branch mismatch in backward pass")
+            in unRevExpr (mkRev fwdNode bwdNode)
 
-            newEnvBindings = [ (n, LinearReversible)
-                             | (n, ty, _) <- binds, isReversible ty ]
-            bodyCtx = ctx { ctxEnv = newEnvBindings ++ ctxEnv ctx }
+-- | Helper function to locate ALL specific linear variables within the AST
+findVars :: Core.Exp Name.Name -> [Name.Name] -> [Name.Name]
+findVars (Core.Var v) vs | v `elem` vs = [v]
+findVars (Core.App e1 e2) vs = findVars e1 vs `union` findVars e2 vs
+findVars (Core.Con _ args) vs = nub (concatMap (`findVars` vs) args)
+findVars (Core.RCon _ args) vs = nub (concatMap (`findVars` vs) args)
+findVars (Core.Lift e1 e2) vs = findVars e1 vs `union` findVars e2 vs
+findVars (Core.Let binds body) vs =
+    let bindVars = concatMap (\(_, _, e) -> findVars e vs) binds
+    in nub (bindVars ++ findVars body vs)
+findVars (Core.Case e alts) vs =
+    let altVars = concatMap (\(_, body) -> findVars body vs) alts
+    in nub (findVars e vs ++ altVars)
+findVars (Core.RCase e alts) vs =
+    let altVars = concatMap (\(_, body, _) -> findVars body vs) alts
+    in nub (findVars e vs ++ altVars)
+findVars (Core.RPin e1 e2) vs = findVars e1 vs `union` findVars e2 vs
+findVars (Core.Abs _ body) vs = findVars body vs
+findVars (Core.Unlift e) vs = findVars e vs
+findVars _ _ = []
 
-        in "(let { " ++ bindsString ++ " } in " ++ compileBackward bodyCtx body ++ ")"
+-- | Dynamically derive the pattern, appending "_res" to avoid shadowing original functions!
+deriveBwdPat :: Core.Exp Name.Name -> [Name.Name] -> HsPat
+deriveBwdPat (Core.RCase _ _) vs =
+    case length vs of
+        0 -> HPTuple []
+        1 -> HPVar (formatName (prettyShow (head vs)) ++ "_res")
+        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
+deriveBwdPat (Core.RPin _ _) vs =
+    case length vs of
+        0 -> HPTuple []
+        1 -> HPVar (formatName (prettyShow (head vs)) ++ "_res")
+        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
+deriveBwdPat (Core.RCon c args) vs =
+    let cName = prettyShow c
+    in if isTupleName cName
+       then HPTuple (map (`deriveBwdPat` vs) args)
+       else HPCon (translateConName cName) (map (`deriveBwdPat` vs) args)
+deriveBwdPat (Core.Con c args) vs =
+    let cName = prettyShow c
+    in if isTupleName cName
+       then HPTuple (map (`deriveBwdPat` vs) args)
+       else HPCon (translateConName cName) (map (`deriveBwdPat` vs) args)
+deriveBwdPat e vs =
+    let found = intersect (findVars e vs) vs
+    in case length found of
+        0 -> HPWild
+        1 -> HPVar (formatName (prettyShow (head found)) ++ "_res")
+        _ -> HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) found)
 
-    -- RPin
-    Core.RPin e1 e2 ->
-        let b1Code = compileBackward ctx e1
-            hCode  = compileBackward ctx e2
-        in "(\\_tup -> case _tup of (_a, _b) -> let _b2 = (" ++ hCode ++ ") _a in (((" ++ b1Code ++ ") _a), (_b2 _b)))"
+compileRCase :: CompileContext -> Core.Exp Name.Name -> [(Core.Pat Name.Name, Core.Exp Name.Name, Core.Exp Name.Name)] -> CompileResult
+compileRCase ctx e alts =
+    let resE = compileExpr ctx e
+        rE = case resE of
+                Reversible r -> r
+                ForwardOnly expr -> RevExpr expr
+    in Reversible $ RevExpr $
+        withRev "_rcase" rE $ \fwdE bwdE ->
 
-    -- Lift
-    Core.Lift e1 e2 ->
-        let fwdCode = compileForward ctx e1
-            bwdCode = compileBackward ctx e2
-        in "(" ++ fwdCode ++ ", " ++ bwdCode ++ ")"
+            let compileFwdAlt (pat, body, _cond) =
+                    let boundVars = map (`Variable` LinearPat) (patVars pat)
+                        altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                        resBody = compileExpr altCtx body
+                        rBody = case resBody of
+                                    Reversible r -> r
+                                    ForwardOnly expr -> RevExpr expr
+                    -- The forward case only returns the forward value.
+                    in (compilePat pat, withRev "_alt" rBody const)
 
-    -- Unlift
-    Core.Unlift _ -> "(\\_v -> _v)"
+                fwdNode = HCase fwdE (map compileFwdAlt alts)
 
-    -- Recursive compilation of the entire function App
-    Core.App e1 e2 ->
-        case e1 of
-            Core.Abs n _ ->
-                let rev2   = isReversibleExpr ctx e2
-                    bKind  = if rev2 then Continuation else PureCopyable
-                    absCtx = ctx { ctxEnv = (n, bKind) : ctxEnv ctx }
-                    code1  = compileBackward absCtx e1
-                    code2  = if rev2 then compileBackward ctx e2 else compileForward ctx e2
-                in "(" ++ code1 ++ " " ++ code2 ++ ")"
-            _ ->
-                if isReversibleAppChain ctx e1 then
-                    let code1 = compileBackward ctx e1
-                        rev2  = isReversibleExpr ctx e2
-                        code2 = if rev2 then compileBackward ctx e2 else compileForward ctx e2
-                    in if needsProjection ctx e1 then
-                "(" ++ projectBwd ctx e1 code1 ++ " " ++ code2 ++ ")"
-                    else
-                        "(" ++ code1 ++ " " ++ code2 ++ ")"
-                else
-                    "(\\_v -> _v)"
+                buildBwd [] = HError "RCase backward match failed"
+                buildBwd ((pat, body, cond):rest) =
+                    let boundVars = map (`Variable` LinearPat) (patVars pat)
+                        altCtx = ctx { ctxEnv = boundVars ++ ctxEnv ctx }
+                        rBody = case compileExpr altCtx body of
+                                    Reversible r -> r
+                                    ForwardOnly expr -> RevExpr expr
 
-    -- Case expressions
-    Core.Case e alts ->
-        let scrutinee = compileForward ctx e
-            compileAlt (p, body) =
-                let pVars   = patVars p
-                    bodyCtx = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                in "  " ++ compilePattern p ++ " -> " ++ compileBackward bodyCtx body
-            altsCode = map compileAlt alts
-        in "(case " ++ scrutinee ++ " of {\n" ++ intercalate ";\n" altsCode ++ "})"
+                        allLinVars = nub [ v | Variable v kind <- ctxEnv altCtx
+                                             , kind `elem` [LinearArg, LinearPat] || prettyShow v == "k" ]
+                        bVars = patVars pat
+                        fVars = intersect (findVars body allLinVars) allLinVars \\ bVars
+                        vars = bVars ++ fVars
 
-    -- Reversible Case expressions (Backwards)
-    Core.RCase e rAlts ->
-        let scrutBwd = compileBackward ctx e
+                        rhsPat = deriveBwdPat body vars
+                        rBodyExpr = unRevExpr rBody
 
-            scrutCall bwdVal = if needsProjection ctx e
-                               then "(" ++ projectBwd ctx e scrutBwd ++ " " ++ bwdVal ++ ")"
-                               else "(" ++ scrutBwd ++ " " ++ bwdVal ++ ")"
+                        bwdScrutinee = HApp bwdE (patToExpRes pat)
 
-            buildIfChain [] = "error \"No matching pin found during inversion in rcase\""
-            buildIfChain ((p, body, pin):rest) =
-                let pinCode   = compileForward ctx pin
-                    pVars     = patVars p
-                    bodyCtx   = ctx { ctxEnv = map (\v -> (v, PureCopyable)) pVars ++ ctxEnv ctx }
-                    bodyBwd   = compileBackward bodyCtx body
+                        retExpr = if null fVars
+                                  then bwdScrutinee
+                                  else HTuple (bwdScrutinee : map (\v -> HVar (formatName (prettyShow v) ++ "_res")) fVars)
 
-                    -- Helper to find which variables are actually used in an expression
-                    varsIn :: Core.Exp Name.Name -> [Name.Name]
-                    varsIn (Core.Var n) = [n]
-                    varsIn (Core.Lit _) = []
-                    varsIn (Core.RCon _ es) = concatMap varsIn es
-                    varsIn (Core.Con _ es) = concatMap varsIn es
-                    varsIn (Core.Let binds letBody) = concatMap (\(_,_,be) -> varsIn be) binds ++ varsIn letBody
-                    varsIn (Core.Case ce alts) = varsIn ce ++ concatMap (\(_,be) -> varsIn be) alts
-                    varsIn (Core.RCase ce ralts) = varsIn ce ++ concatMap (\(_,be,_) -> varsIn be) ralts
-                    varsIn (Core.App e1 e2) = varsIn e1 ++ varsIn e2
-                    varsIn (Core.Abs an ae) = filter (/= an) (varsIn ae)
-                    varsIn (Core.RPin e1 e2) = varsIn e1 ++ varsIn e2
-                    varsIn (Core.Lift e1 e2) = varsIn e1 ++ varsIn e2
-                    varsIn (Core.Unlift ue) = varsIn ue
+                        -- This prevents Type Clashes across branches and solves variable scoping.
+                        branchExec =
+                            HLet [ (compilePat pat, fwdE) ] $
+                                HLet [ (HPTuple [HPVar "_body_fwd", HPVar "_body_bwd"], rBodyExpr) ] $
+                                    HLet [ (rhsPat, HApp (HVar "_body_bwd") (HVar "_out")) ]
+                                        retExpr
 
-                    -- Helper to deduce the exact tuple pattern matching bodyBwd's shape
-                    buildTuplePat :: Core.Exp Name.Name -> [Name.Name] -> String
-                    buildTuplePat expr allowed =
-                        let exprVarsUnordered = varsIn expr
-                            exprVars = filter (`elem` exprVarsUnordered) allowed
-                        in case expr of
-                            Core.Var n -> if n `elem` allowed then formatName (prettyShow n) else "_"
-                            Core.RCon _ es ->
-                                let pats = map (`buildTuplePat` allowed) es
-                                in case pats of
-                                    []  -> "()"
-                                    [pat] -> pat
-                                    _   -> "(" ++ intercalate ", " pats ++ ")"
-                            Core.Let _ bodyExp -> buildTuplePat bodyExp allowed
-                            Core.Case _ alts -> if null alts then "_" else buildTuplePat (snd $ head alts) allowed
-                            Core.RCase _ ralts -> if null ralts then "_" else buildTuplePat (let (_, b, _) = head ralts in b) allowed
-                            Core.Lit _ -> "()"
-                            _ -> case exprVars of
-                                    []  -> "_"
-                                    [v] -> formatName (prettyShow v)
-                                    vs  -> "(" ++ intercalate ", " (map (formatName . prettyShow) vs) ++ ")"
+                        condCheck = HApp (getRawExpr (compileExpr ctx cond)) (HVar "_out")
 
-                    upPat     = buildTuplePat body pVars
-                    branchVal = "(let !" ++ upPat ++ " = (" ++ bodyBwd ++ ") _v in " ++ compilePattern p ++ ")"
+                    in HIf condCheck branchExec (buildBwd rest)
 
-                in "if (" ++ pinCode ++ ") _v then " ++ scrutCall branchVal ++ " else " ++ buildIfChain rest
-        in "(\\_v -> " ++ buildIfChain rAlts ++ ")"
+                bwdNode = HLam [HPVar "_out"] (buildBwd alts)
 
-    _ -> "(\\_v -> _v)"
+            in unRevExpr (mkRev fwdNode bwdNode)
 
-
--- Function to compile data declarations
+-- | Function to compile data declarations
 compileDDecl :: Core.DDecl Name.Name -> String
 compileDDecl (Core.DDecl dataName tyVars constructors) =
     let
-        -- Data type name and type variables
         nameStr = prettyShow dataName
         tyVarStrs = unwords (map prettyShow tyVars)
-        -- Left-hand side of the equals sign
         lhs = if null tyVars
             then "data " ++ nameStr
             else "data " ++ nameStr ++ " " ++ tyVarStrs
-        -- Helper function to compile a single constructor
-        compileCon (conName, _existentials, _constraints, argTypes) =
+
+        compileCons (conName, _existentials, _constraints, argTypes) =
             let cNameStr = translateConName (prettyShow conName)
-                -- wrap types in parentheses
                 formatArg ty =
                     let typeStr = prettyShow ty
                     in if ' ' `elem` typeStr && not ("(" `isPrefixOf` typeStr)
                         then "(" ++ typeStr ++ ")"
                         else typeStr
-
                 argsStr = unwords (map formatArg argTypes)
             in if null argTypes
                 then cNameStr
                 else cNameStr ++ " " ++ argsStr
-        -- Right-hand side of the equals sign
-        rhs = intercalate " | " (map compileCon constructors)
+
+        rhs = intercalate " | " (map compileCons constructors)
     in
         lhs ++ " = " ++ rhs ++ " deriving Show"
 
--- Helper function to capitalize first character of a string
+-- | Helper function to capitalize first character of a string
 capitalize :: String -> String
 capitalize "" = ""
 capitalize (x:xs) = toUpper x : xs
@@ -469,21 +574,19 @@ isShowableTy ty = case ty of
     TyCon _ args                  -> all isShowableTy args
     _                             -> True
 
--- Helper function to construct the main IO function that logs all bindings
+-- | Helper function to construct the main IO function that logs all bindings
 constructPutStrLn :: (Name.Name, Ty, Core.Exp Name.Name) -> String
 constructPutStrLn (name, _, _) = "\"\\n" ++ prettyShow name ++ ": \" ++ show " ++ formatName (prettyShow name)
 
 generateHaskellModule :: String -> [(Name.Name, PolyTy)] -> [Core.DDecl Name.Name] -> [(Name.Name, Ty, Core.Exp Name.Name)] -> (String, String)
 generateHaskellModule modName typeMap ddecls bindings =
     let
-        initCtx = CompilerContext
-                    { ctxTypeMap  = typeMap
-                    , ctxEnv = []
-                    , ctxMode = Outside
-                    }
-        generatedDecls = map (compileBinding initCtx) bindings
+        initCtx = CompileContext { ctxTypeMap = typeMap, ctxEnv = [] }
+
+        generatedDecls = concatMap (map prettyHsDecl . compileBinding initCtx) bindings
         compiledDDecls = map compileDDecl ddecls
         showableBindings = filter (\(_, ty, _) -> isShowableTy ty) bindings
+
         haskellCode = unlines $
               ["{-# LANGUAGE BangPatterns #-}"
               ,"module " ++ capitalize modName ++ " where"

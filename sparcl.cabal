@@ -90,7 +90,6 @@ library
       Language.Sparcl.TH
       Language.Sparcl.Compiler.Compiler
       Language.Sparcl.Compiler.Haskell
-      Language.Sparcl.Compiler.Haskell2
 
   other-modules:
 
