@@ -7,7 +7,7 @@ import           Language.Sparcl.Pretty (prettyShow)
 import           Data.List
 import           Data.Maybe
 import           Data.Char (toUpper)
-import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@), PolyTy)
+import           Language.Sparcl.Typing.Type (Ty(..), QualTy(..), pattern (:-@), PolyTy, TyConstraint(..))
 import           Language.Sparcl.Compiler.PreludeExports (preludeExports)
 
 -- | Target Haskell Patterns
@@ -37,6 +37,7 @@ data HsExpr
 data HsDecl
     = HBind String HsExpr
     | HData String [String] [(String, [String])] Bool
+    | HGADTData String [String] [(String, String)]
     deriving (Eq, Show)
 
 -- | Strip the module prefix for checking operator/tuple names
@@ -100,6 +101,10 @@ prettyHsDecl decl = case decl of
             rhs = intercalate " | " [ unwords (c : args) | (c, args) <- cons ]
             derivingClause = if isShowable then " deriving Show" else ""
         in "data " ++ lhs ++ " = " ++ rhs ++ derivingClause
+    HGADTData dName tyVars cons ->
+        let lhs = unwords (dName : tyVars)
+            linesList = ("data " ++ lhs ++ " where") : [ "  " ++ cName ++ " :: " ++ sig | (cName, sig) <- cons ]
+        in intercalate "\n" linesList
 
 data Variable = Variable
     { varName :: Name.Name
@@ -533,6 +538,43 @@ isShowableDataTy ty = case ty of
     TyCon _ args                  -> all isShowableDataTy args
     _                             -> True
 
+-- | Helper to detect Equality Constraints
+isTyEq :: TyConstraint -> Bool
+isTyEq (TyEq _ _) = True
+isTyEq _          = False
+
+-- | Compiling GADT Constructors
+compileGADTCons :: String -> [String] -> (Name.Name, a, [TyConstraint], [Ty]) -> (String, String)
+compileGADTCons dNameStr tyVarStrs (conName, _, constraints, argTypes) =
+   let cNameStr = translateConName (prettyShow conName)
+       formatArg ty =
+           let typeStr = prettyShow ty
+           in if ' ' `elem` typeStr && not ("(" `isPrefixOf` typeStr)
+               then "(" ++ typeStr ++ ")"
+               else typeStr
+       argStrs = map formatArg argTypes
+
+       formatConstraint (TyEq t1 t2) = Just (prettyShow t1 ++ " ~ " ++ prettyShow t2)
+       formatConstraint _            = Nothing
+
+       eqConstraints = mapMaybe formatConstraint constraints
+       ctxStr = if null eqConstraints then "" else "(" ++ intercalate ", " eqConstraints ++ ") => "
+
+       retTyStr = unwords (dNameStr : tyVarStrs)
+       sig = ctxStr ++ intercalate " -> " (argStrs ++ [retTyStr])
+   in (cNameStr, sig)
+
+-- | Compiling normal (non-GADT) constructors
+compileCons :: (Name.Name, a, b, [Ty]) -> ((String, [String]), Bool)
+compileCons (conName, _, _, argTypes) =
+       let cNameStr = translateConName (prettyShow conName)
+           formatArg ty =
+               let typeStr = prettyShow ty
+               in if ' ' `elem` typeStr && not ("(" `isPrefixOf` typeStr)
+                   then "(" ++ typeStr ++ ")"
+                   else typeStr
+       in ((cNameStr, map formatArg argTypes), all isShowableDataTy argTypes)
+
 -- | Function to compile data declarations into the target AST
 compileDDecl :: Core.DDecl Name.Name -> HsDecl
 compileDDecl (Core.DDecl dataName tyVars constructors) =
@@ -540,21 +582,18 @@ compileDDecl (Core.DDecl dataName tyVars constructors) =
         dNameStr = prettyShow dataName
         tyVarStrs = map prettyShow tyVars
 
-        compileCons (conName, _existentials, _constraints, argTypes) =
-            let cNameStr = translateConName (prettyShow conName)
-                formatArg ty =
-                    let typeStr = prettyShow ty
-                    in if ' ' `elem` typeStr && not ("(" `isPrefixOf` typeStr)
-                        then "(" ++ typeStr ++ ")"
-                        else typeStr
-            in ((cNameStr, map formatArg argTypes), all isShowableDataTy argTypes)
+        -- If any constructor has a TyEq constraint, this is a GADT
+        isGADT = any (\(_, _, constraints, _) -> any isTyEq constraints) constructors
 
-        compiledCons = map compileCons constructors
-        consDecls = map fst compiledCons
-
-        isDataShowable = all snd compiledCons
-    in
-        HData dNameStr tyVarStrs consDecls isDataShowable
+    in if isGADT
+       then
+           -- Pass the data name and type variables down to the GADT compiler
+           HGADTData dNameStr tyVarStrs (map (compileGADTCons dNameStr tyVarStrs) constructors)
+       else
+           let compiledCons = map compileCons constructors
+               consDecls = map fst compiledCons
+               isDataShowable = all snd compiledCons
+           in HData dNameStr tyVarStrs consDecls isDataShowable
 
 -- | Helper function to capitalize first character of a string
 capitalize :: String -> String
@@ -607,8 +646,14 @@ generateHaskellModule modName typeMap ddecls bindings =
         hidingList   = nub $ filter (`elem` preludeExports) definedNames
 
         importDecl = (["import Prelude hiding (" ++ intercalate ", " hidingList ++ ")" | not (null hidingList)])
+        hasGADT = any (\(Core.DDecl _ _ cons) -> any (\(_, _, cs, _) -> any isTyEq cs) cons) ddecls
+
+        pragmas = if hasGADT
+                  then ["{-# LANGUAGE GADTs #-}", "{-# LANGUAGE TypeFamilies #-}"]
+                  else []
 
         haskellCode = unlines $
+              pragmas ++
               ["module " ++ capitalize modName ++ " where"
               , ""
               ] ++ importDecl ++ compiledDDecls ++
