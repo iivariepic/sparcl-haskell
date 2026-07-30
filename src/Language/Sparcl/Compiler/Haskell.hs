@@ -606,15 +606,12 @@ generateHaskellModule modName typeMap ddecls bindings =
         definedNames = bindingNames ++ dataNames
         hidingList   = nub $ filter (`elem` preludeExports) definedNames
 
-        importDecl = if null hidingList
-                     then "import Prelude"
-                     else "import Prelude hiding (" ++ intercalate ", " hidingList ++ ")"
+        importDecl = (["import Prelude hiding (" ++ intercalate ", " hidingList ++ ")" | not (null hidingList)])
 
         haskellCode = unlines $
               ["module " ++ capitalize modName ++ " where"
               , ""
-              , importDecl
-              ] ++ compiledDDecls ++
+              ] ++ importDecl ++ compiledDDecls ++
               [ ""
               , "main :: IO ()"
               , "main = putStrLn (" ++ printStr ++ ")"
