@@ -16,6 +16,7 @@ data HsPat
     | HPCon String [HsPat]
     | HPTuple [HsPat]
     | HPWild
+    | HPIrrefutable HsPat
     deriving (Eq, Show)
 
 -- | Target Haskell Expressions
@@ -39,6 +40,49 @@ data HsDecl
     | HData String [String] [(String, [String])] Bool
     | HGADTData String [String] [(String, String)]
     deriving (Eq, Show)
+
+-- | Pretty print target patterns
+prettyHsPat :: HsPat -> String
+prettyHsPat pat = case pat of
+    HPVar v       -> v
+    HPCon c []    -> c
+    HPCon c ps    -> "(" ++ c ++ " " ++ unwords (map prettyHsPat ps) ++ ")"
+    HPTuple ps    -> "(" ++ intercalate ", " (map prettyHsPat ps) ++ ")"
+    HPWild        -> "_"
+    HPIrrefutable p@(HPTuple _) -> "~" ++ prettyHsPat p
+    HPIrrefutable p@(HPVar _)   -> "~" ++ prettyHsPat p
+    HPIrrefutable HPWild        -> "~_"
+    HPIrrefutable p             -> "~(" ++ prettyHsPat p ++ ")"
+
+-- | Pretty print target expressions
+prettyHsExpr :: Int -> HsExpr -> String
+prettyHsExpr p expr = case expr of
+    HVar v        -> v
+    HCon c        -> c
+    HLit l        -> l
+    HApp e1 e2    -> parensIf (p > 10) $ prettyHsExpr 10 e1 ++ " " ++ prettyHsExpr 11 e2
+    HOp op e1 e2  -> parensIf (p > 5)  $ prettyHsExpr 6 e1 ++ " " ++ op ++ " " ++ prettyHsExpr 6 e2
+    HLam ps e     -> parensIf (p > 0)  $ "\\ " ++ unwords (map prettyHsPat ps) ++ " -> " ++ prettyHsExpr 0 e
+    HLet binds e  -> parensIf (p > 0)  $ "let { " ++ intercalate "; " [ prettyHsPat pat ++ " = " ++ prettyHsExpr 0 b | (pat, b) <- binds ] ++ " } in " ++ prettyHsExpr 0 e
+    HCase e alts  -> parensIf (p > 0)  $ "case " ++ prettyHsExpr 0 e ++ " of {\n" ++ intercalate ";\n" [ "  " ++ prettyHsPat pat ++ " -> " ++ prettyHsExpr 0 body | (pat, body) <- alts ] ++ "\n}"
+    HTuple es     -> "(" ++ intercalate ", " (map (prettyHsExpr 0) es) ++ ")"
+    HIf c t f     -> parensIf (p > 0)  $ "if " ++ prettyHsExpr 0 c ++ " then " ++ prettyHsExpr 0 t ++ " else " ++ prettyHsExpr 0 f
+    HError msg    -> parensIf (p > 10) $ "error " ++ show msg
+
+-- | Pretty print target top-level declarations
+prettyHsDecl :: HsDecl -> String
+prettyHsDecl decl = case decl of
+    HBind name e -> name ++ " = " ++ prettyHsExpr 0 e
+    HData dName tyVars cons isShowable ->
+        let lhs = unwords (dName : tyVars)
+            rhs = intercalate " | " [ unwords (c : args) | (c, args) <- cons ]
+            derivingClause = if isShowable then " deriving Show" else ""
+        in "data " ++ lhs ++ " = " ++ rhs ++ derivingClause
+    HGADTData dName tyVars cons ->
+        let lhs = unwords (dName : tyVars)
+            linesList = ("data " ++ lhs ++ " where") : [ "  " ++ cName ++ " :: " ++ sig | (cName, sig) <- cons ]
+        in intercalate "\n" linesList
+
 
 -- | Strip the module prefix for checking operator/tuple names
 stripBase :: String -> String
@@ -67,44 +111,6 @@ isTupleName name =
 parensIf :: Bool -> String -> String
 parensIf True  s = "(" ++ s ++ ")"
 parensIf False s = s
-
--- | Pretty print target patterns
-prettyHsPat :: HsPat -> String
-prettyHsPat pat = case pat of
-    HPVar v       -> v
-    HPCon c []    -> c
-    HPCon c ps    -> "(" ++ c ++ " " ++ unwords (map prettyHsPat ps) ++ ")"
-    HPTuple ps    -> "(" ++ intercalate ", " (map prettyHsPat ps) ++ ")"
-    HPWild        -> "_"
-
--- | Pretty print target expressions
-prettyHsExpr :: Int -> HsExpr -> String
-prettyHsExpr p expr = case expr of
-    HVar v        -> v
-    HCon c        -> c
-    HLit l        -> l
-    HApp e1 e2    -> parensIf (p > 10) $ prettyHsExpr 10 e1 ++ " " ++ prettyHsExpr 11 e2
-    HOp op e1 e2  -> parensIf (p > 5)  $ prettyHsExpr 5 e1 ++ " " ++ op ++ " " ++ prettyHsExpr 6 e2
-    HLam ps e     -> parensIf (p > 0)  $ "\\" ++ unwords (map prettyHsPat ps) ++ " -> " ++ prettyHsExpr 0 e
-    HLet binds e  -> parensIf (p > 0)  $ "let { " ++ intercalate "; " [ prettyHsPat pat ++ " = " ++ prettyHsExpr 0 b | (pat, b) <- binds ] ++ " } in " ++ prettyHsExpr 0 e
-    HCase e alts  -> parensIf (p > 0)  $ "case " ++ prettyHsExpr 0 e ++ " of {\n" ++ intercalate ";\n" [ "  " ++ prettyHsPat pat ++ " -> " ++ prettyHsExpr 0 body | (pat, body) <- alts ] ++ "\n}"
-    HTuple es     -> "(" ++ intercalate ", " (map (prettyHsExpr 0) es) ++ ")"
-    HIf c t f     -> parensIf (p > 0)  $ "if " ++ prettyHsExpr 0 c ++ " then " ++ prettyHsExpr 0 t ++ " else " ++ prettyHsExpr 0 f
-    HError msg    -> parensIf (p > 10) $ "error " ++ show msg
-
--- | Pretty print target top-level declarations
-prettyHsDecl :: HsDecl -> String
-prettyHsDecl decl = case decl of
-    HBind name e -> name ++ " = " ++ prettyHsExpr 0 e
-    HData dName tyVars cons isShowable ->
-        let lhs = unwords (dName : tyVars)
-            rhs = intercalate " | " [ unwords (c : args) | (c, args) <- cons ]
-            derivingClause = if isShowable then " deriving Show" else ""
-        in "data " ++ lhs ++ " = " ++ rhs ++ derivingClause
-    HGADTData dName tyVars cons ->
-        let lhs = unwords (dName : tyVars)
-            linesList = ("data " ++ lhs ++ " where") : [ "  " ++ cName ++ " :: " ++ sig | (cName, sig) <- cons ]
-        in intercalate "\n" linesList
 
 data Variable = Variable
     { varName :: Name.Name
@@ -156,7 +162,7 @@ withRev :: String -> RevExpr -> (HsExpr -> HsExpr -> HsExpr) -> HsExpr
 withRev prefix (RevExpr e) mkBody =
     let fName = prefix ++ "_fwd"
         bName = prefix ++ "_bwd"
-    in HLet [(HPTuple [HPVar fName, HPVar bName], e)]
+    in HLet [(HPIrrefutable (HPTuple [HPVar fName, HPVar bName]), e)]
             (mkBody (HVar fName) (HVar bName))
 
 -- | Helper to get a reversible expression from both CompileResult types
@@ -225,6 +231,19 @@ translateConName name
 -- | Semantic mapping for Sparcl primitive functions to Haskell native equivalents
 translatePrimitive :: String -> String
 translatePrimitive "leInt"  = "(<=)"
+translatePrimitive "ltInt"  = "(<)"
+translatePrimitive "eqInt"  = "(==)"
+translatePrimitive "addInt" = "(+)"
+translatePrimitive "subInt" = "(-)"
+translatePrimitive "mulInt" = "(*)"
+translatePrimitive "divInt" = "div"
+-- Rational primitives
+translatePrimitive "+%" = "(+)"
+translatePrimitive "-%" = "(-)"
+translatePrimitive "*%" = "(*)"
+translatePrimitive "/%" = "(/)"
+translatePrimitive "ltRational" = "(<)"
+translatePrimitive "eqRational" = "(==)"
 translatePrimitive other    = other
 
 -- | Compile a top-level binding into a list of Haskell AST declarations
@@ -276,7 +295,11 @@ compileLift :: CompileContext -> Core.Exp Name.Name -> Core.Exp Name.Name -> Com
 compileLift ctx e1 e2 =
     let fwdEx = getFwd (compileExpr ctx e1)
         bwdEx = getFwd (compileExpr ctx e2)
-    in ForwardOnly (HTuple [fwdEx, bwdEx])
+    in ForwardOnly $
+        HLam [HPIrrefutable (HPTuple [HPVar "_arg_fwd", HPVar "_arg_bwd"])] $
+            HTuple [ HApp fwdEx (HVar "_arg_fwd")
+                   , HLam [HPVar "_out"] (HApp (HVar "_arg_bwd") (HApp bwdEx (HVar "_out")))
+                   ]
 
 -- | Compiling Unlift
 compileUnlift :: CompileContext -> Core.Exp Name.Name -> CompileResult
@@ -286,12 +309,12 @@ compileUnlift ctx e = case compileExpr ctx e of
         let wrappedAs = HTuple [HVar "_as", HLam [HPVar "_v"] (HVar "_v")]
 
             fwdFun = HLam [HPVar "_as"] $
-                HLet [(HPTuple [HPVar "_fwd_val", HPWild], HApp h wrappedAs)]
+                HLet [(HPIrrefutable (HPTuple [HPVar "_fwd_val", HPWild]), HApp h wrappedAs)]
                      (HVar "_fwd_val")
 
             bwdFun = HLam [HPVar "_out"] $
                 HLet [ (HPVar "_as", HApp (HVar "_bwd_rec") (HVar "_out"))
-                     , (HPTuple [HPWild, HPVar "_bwd_closure"], HApp h wrappedAs)
+                     , (HPIrrefutable (HPTuple [HPWild, HPVar "_bwd_closure"]), HApp h wrappedAs)
                      ]
                      (HApp (HVar "_bwd_closure") (HVar "_out"))
 
@@ -328,7 +351,14 @@ compileApp ctx e1 e2 = case e1 of
     Core.App (Core.Var op) lhs | isOperatorName (stripBase (prettyShow op)) ->
         let l = getRawExpr (compileExpr ctx lhs)
             r = getRawExpr (compileExpr ctx e2)
-        in ForwardOnly (HOp (stripBase (prettyShow op)) l r)
+            rawOpName = stripBase (prettyShow op)
+            transOp   = translatePrimitive rawOpName
+            -- Safely extract infix representation
+            finalOp | "(" `isPrefixOf` transOp && ")" `isSuffixOf` transOp =
+                        take (length transOp - 2) (drop 1 transOp)
+                    | isOperatorName transOp = transOp
+                    | otherwise = "`" ++ transOp ++ "`"
+        in ForwardOnly (HOp finalOp l r)
     _ ->
         let f1 = getRawExpr (compileExpr ctx e1)
             f2 = getRawExpr (compileExpr ctx e2)
@@ -416,13 +446,21 @@ compileRPin ctx e1 e2 =
         fwd_e2 = getFwd (compileExpr ctx e2)
         r1 = toRev res1
     in Reversible $ RevExpr $
-        withRev "_pin" r1 $ \fwd_e1 bwd_e1 ->
-            let fwdNode = fwd_e1
-                bwdNode = HLam [HPVar "_out"] $
-                    HIf (HApp fwd_e2 (HVar "_out"))
-                        (HApp bwd_e1 (HVar "_out"))
-                        (HError "Pin predicate failed: Branch mismatch in backward pass")
-            in unRevExpr (mkRev fwdNode bwdNode)
+        withRev "_pin1" r1 $ \fwd_e1 bwd_e1 ->
+            -- 1. FORWARD PASS: Evaluate g using the forward x (fwd_e1)
+            let e2_res_fwd = HApp fwd_e2 fwd_e1
+            in HLet [(HPIrrefutable (HPTuple [HPVar "_pin2_fwd", HPWild]), e2_res_fwd)] $
+
+                let fwdNode = HTuple [fwd_e1, HVar "_pin2_fwd"]
+                    bwdNode = HLam [HPIrrefutable (HPTuple [HPVar "_out1", HPVar "_out2"])] $
+
+                        -- 2. BACKWARD PASS: Re-evaluate g using the RECONSTRUCTED x (_out1)
+                        let e2_res_bwd = HApp fwd_e2 (HVar "_out1")
+                        in HLet [(HPIrrefutable (HPTuple [HPWild, HPVar "_pin2_bwd_bwd"]), e2_res_bwd)] $
+                            HTuple [ HApp bwd_e1 (HVar "_out1")
+                                   , HApp (HVar "_pin2_bwd_bwd") (HVar "_out2")
+                                   ]
+                in unRevExpr (mkRev fwdNode bwdNode)
 
 -- | Helper function to locate ALL specific linear variables within the AST
 findVars :: Core.Exp Name.Name -> [Name.Name] -> [Name.Name]
@@ -447,13 +485,8 @@ findVars _ _ = []
 
 -- | Dynamically derive the pattern, appending "_res" to avoid shadowing original functions!
 deriveBwdPat :: Core.Exp Name.Name -> [Name.Name] -> HsPat
+deriveBwdPat (Core.RPin e1 e2) vs = HPTuple [deriveBwdPat e1 vs, deriveBwdPat e2 vs] -- NEW FIX FOR PIN
 deriveBwdPat (Core.RCase _ _) []  = HPTuple []
-deriveBwdPat (Core.RCase _ _) [v] = HPVar (formatName (prettyShow v) ++ "_res")
-deriveBwdPat (Core.RCase _ _) vs  = HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
-
-deriveBwdPat (Core.RPin _ _) []  = HPTuple []
-deriveBwdPat (Core.RPin _ _) [v] = HPVar (formatName (prettyShow v) ++ "_res")
-deriveBwdPat (Core.RPin _ _) vs  = HPTuple (map (\v -> HPVar (formatName (prettyShow v) ++ "_res")) vs)
 
 deriveBwdPat (Core.RCon c args) vs =
     let cName = prettyShow c
@@ -515,9 +548,9 @@ compileRCase ctx e alts =
 
                         -- This prevents Type Clashes across branches and solves variable scoping.
                         branchExec =
-                            HLet [ (compilePat pat, fwdE) ] $
-                                HLet [ (HPTuple [HPVar "_body_fwd", HPVar "_body_bwd"], rBodyExpr) ] $
-                                    HLet [ (rhsPat, HApp (HVar "_body_bwd") (HVar "_out")) ]
+                            HLet [ (HPIrrefutable (compilePat pat), fwdE) ] $
+                                HLet [ (HPIrrefutable (HPTuple [HPVar "_body_fwd", HPVar "_body_bwd"]), rBodyExpr) ] $
+                                    HLet [ (HPIrrefutable rhsPat, HApp (HVar "_body_bwd") (HVar "_out")) ]
                                         retExpr
 
                         condCheck = HApp (getRawExpr (compileExpr ctx cond)) (HVar "_out")
@@ -646,6 +679,7 @@ generateHaskellModule modName typeMap ddecls bindings =
         hidingList   = nub $ filter (`elem` preludeExports) definedNames
 
         importDecl = (["import Prelude hiding (" ++ intercalate ", " hidingList ++ ")" | not (null hidingList)])
+                             ++ ["import Data.Ratio"]
         hasGADT = any (\(Core.DDecl _ _ cons) -> any (\(_, _, cs, _) -> any isTyEq cs) cons) ddecls
 
         pragmas = if hasGADT
