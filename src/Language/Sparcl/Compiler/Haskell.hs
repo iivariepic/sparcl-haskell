@@ -267,8 +267,10 @@ compilePat pat = case pat of
 
 -- | Helper for literals
 compileLiteral :: Literal.Literal -> HsExpr
-compileLiteral (Literal.LitInt i) = HLit (show i)
-compileLiteral _ = HError "Unhandled literal type"
+compileLiteral (Literal.LitInt i)      = HLit (show i)
+compileLiteral (Literal.LitDouble d)   = HLit (show d)
+compileLiteral (Literal.LitChar c)     = HLit (show c)
+compileLiteral (Literal.LitRational q) = HLit ("(" ++ show q ++ ")")
 
 -- | The expression compilation pass routing to specialized helpers
 compileExpr :: CompileContext -> Core.Exp Name.Name -> CompileResult
